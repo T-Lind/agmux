@@ -6,17 +6,17 @@ Claude Code / … , get told when an agent finishes, and see your usage limits �
 without leaving the terminal.
 
 ```
-agmux 0.2.0                3 sessions · 1 running · 1 done
+agmux 0.3.0           4 sessions · 1 running · 1 need input · 1 done
 Codex · 5h 12% · 7d 34%                               Ctrl-G details
-Search: 
-▶ upgrades-4    Codex     2w  attached  codex  ~/source/repos/ty      4m
-✓ agmux        OpenCode  1w            bash   ~/source/repos/agmux  12m  ✓
-· scratch      Shell     1w            vim    ~/notes               1h
+Search:
+! ty-review   Codex    2w  needs input   codex  ~/source/repos/ty     2m
+▶ upgrades-4  Codex    2w  attached      codex  ~/source/repos/ty     4m
+✓ agmux       OpenCode 1w                bash   ~/source/repos/agmux  12m ✓
+· scratch     Shell    1w                vim    ~/notes               1h
 ──────────────────────────────────────────────────────────────────────
 codex  |  ~/source/repos/ty
-  Fixed the flaky test and reran the suite.
-  > All 42 tests passed.
-1 of 3 sessions   Enter attach · Ctrl-N new · Ctrl-R rename · Ctrl-D delete · F1 help
+! needs input: Allow command?  1. Yes  2. Yes, and don't ask again  3. No
+1 of 4 sessions   Enter attach · Ctrl-N new · Ctrl-R rename · Ctrl-D delete · F1 help
 ```
 
 ## Why
@@ -32,6 +32,12 @@ layer that answers those questions and stays out of the way.
   Goose, and can launch any of them — or a plain shell — in a tmux session.
 - **Tells you when it's done.** Agent sessions started by agmux are flagged
   `✓` when they finish and fire a desktop notification.
+- **Tells you when it needs you.** If an agent is waiting on a permission or
+  confirmation prompt, agmux flags it `!`, sorts it to the top, and can notify
+  you — so you are not left staring at a stalled session.
+- **Live previews in color.** The preview and the read-only viewer render the
+  pane's own colors and styles (parsed and re-emitted safely, never raw), and
+  trim the agent's input composer and status footer so you see real output.
 - **Usage at a glance.** Reads the rate-limit windows Codex already writes to
   disk and shows them in the header and in a detail panel.
 - **Safe by construction.** No shell command strings, literal argument passing,
@@ -103,8 +109,9 @@ agmux delete ty-review                  # asks you to type the name
 agmux kill ty-review --yes              # alias of delete, skip the typing
 agmux usage                             # rate-limit windows, read locally
 agmux agents                            # known agents and whether they're installed
-agmux preview ty-review                 # recent output, plain text
+agmux preview ty-review                 # recent output, with the pane's colors
 agmux peek ty-review                    # live read-only viewer
+agmux watch                             # notify when an agent needs input
 agmux last                              # previous session (inside tmux)
 agmux detach
 agmux doctor                            # check tools and integration
@@ -143,6 +150,33 @@ export AGMUX_NOTIFY_CMD='ntfy publish mytopic "{body}"'
 The command is split with shell-like quoting and executed directly; no shell is
 involved.
 
+### When an agent needs you
+
+agmux reads the active pane's visible screen and classifies each agent session
+as **working**, **idle** (alive at its prompt), or **blocked** (a permission,
+confirmation, or question prompt). Blocked sessions are sorted to the top of the
+picker and flagged `!`, and the picker header counts how many need input. The
+detected prompt line is shown above the preview and appended to `agmux list`.
+
+For agent sessions agmux starts, a small watcher thread polls the pane while the
+agent runs and raises the same desktop/tmux notification for a blocked prompt.
+For sessions started elsewhere, run the standalone watcher, which notifies on
+any transition into the blocked state:
+
+```bash
+agmux watch                # poll every few seconds until interrupted
+agmux watch --once         # a single pass (handy in scripts)
+```
+
+Detection is heuristic — agents draw their prompts differently and change them
+over time. The defaults cover common `[y/N]` / "Allow …" / "Would you like to …"
+/ numbered-approval forms. Extend them with `AGMUX_BLOCKED_PATTERNS` and
+`AGMUX_WORKING_PATTERNS`: `'|'`-joined regular expressions appended to the
+built-ins, matched case-insensitively against the last screen lines.
+
+Entering a session clears any tmux copy-mode on its panes (`send-keys -X
+cancel`), so you always land on the live view rather than a stale scrollback.
+
 ### Usage limits
 
 Codex records token counts and rate-limit windows in its local session logs.
@@ -169,6 +203,10 @@ windows — start a build, tail a log, run `htop`, whatever.
 | `AGMUX_TMUX_SOCKET` | tmux socket to use | current or default |
 | `AGMUX_NOTIFY` | `0` disables completion notifications | `1` |
 | `AGMUX_NOTIFY_CMD` | custom notification command | unset |
+| `AGMUX_WATCH_INTERVAL` | seconds between blocked-prompt checks | `3` |
+| `AGMUX_BLOCKED_PATTERNS` | extra `|`-joined regexes for "needs input" | unset |
+| `AGMUX_WORKING_PATTERNS` | extra `|`-joined regexes for "working" | unset |
+| `AGMUX_TRIM_CHROME` | `0` keeps agent input/footer lines in previews | `1` |
 | `AGMUX_ASCII` | `1` forces ASCII glyphs | unset |
 | `AGMUX_BIN` | path to `agmux` used by the tmux popup | `agmux` |
 | `CODEX_HOME` | where Codex stores session logs | `~/.codex` |
@@ -197,7 +235,8 @@ bash -n completion.bash
 Both suites use a private tmux socket and a fake agent binary, so they never
 touch your real sessions. The unit suite covers creation, exact selection,
 rename, preview, literal argument quoting, deletion confirmation and
-revalidation, shell windows, agent detection, usage parsing, notifications, and
+revalidation, shell windows, agent detection, ANSI parsing/rendering, screen
+classification, copy-mode cancellation, usage parsing, notifications, and
 `NO_COLOR`/piped output. The smoke test drives the picker, viewer, usage panel,
 new-session wizard, popup switching, and delete flow end to end.
 

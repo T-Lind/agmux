@@ -14,6 +14,9 @@ vendor, updater, background service, or network client.
 - The newest Codex session log under `$CODEX_HOME/sessions` (default
   `~/.codex/sessions`), and only its trailing bytes, to read the `rate_limits`
   record for the usage panel. No other part of the log is displayed or stored.
+- The visible text of a session's active pane, read with `capture-pane`, to
+  label the agent and to classify whether it is working, idle, or waiting on
+  the user.
 - Executable locations on `PATH` for tmux and the agent binaries, and the
   normal shell path.
 - Settings such as `TMUX`, `TMUX_PANE`, `AGMUX_*`, `CX_*`, and `SHELL`.
@@ -51,6 +54,11 @@ contain anything already printed by the program in that pane; use `Ctrl-P` or
   no input is injected into any existing pane.
 - The read-only viewer captures output without attaching a tmux client or
   sending keys to the pane.
+- Entering a session cancels tmux copy-mode on its panes with `send-keys -X
+  cancel`, which exits the mode without typing into the running program.
+- Preview and viewer output is parsed for SGR styling only. agmux reconstructs
+  a fixed, canonical set of color/attribute codes from the parsed styles and
+  never writes a pane's original escape bytes to the terminal.
 
 ## Notifications
 
@@ -60,6 +68,11 @@ via `AGMUX_NOTIFY_CMD`. That command is split with shell-like quoting and
 executed directly with `subprocess.Popen` as an argv list — no shell is
 involved — so placeholders are substituted as data. agmux sends no data over the
 network itself.
+
+While an agent started by agmux runs, a small daemon thread polls its pane and
+raises the same notification if it looks blocked on a prompt; `agmux watch` does
+the same for all sessions from the command line. These checks only read the
+visible screen (via `capture-pane`) and never send input to a pane.
 
 ## Color
 

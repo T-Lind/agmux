@@ -13,15 +13,17 @@ import json
 import locale
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 
 APP = "agmux"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SELF = Path(__file__).resolve()
 
 
@@ -82,6 +84,8 @@ for _agent in (
     AGENTS[_agent.key] = _agent
 
 _BY_BINARY = {a.binary: a for a in AGENTS.values() if a.binary}
+SHELL_COMMANDS = {"bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "nu",
+                  "elvish", "pwsh"}
 
 
 def detect_agent(process, explicit=None):
@@ -143,20 +147,372 @@ def paint_segments(segments, enabled):
 
 def _pick_glyphs():
     if os.environ.get("AGMUX_ASCII"):
-        return {"running": ">", "finished": "*", "shell": ".", "bar_full": "#",
-                "bar_empty": "-", "sep": "-", "dot": "*"}
+        return {"running": ">", "finished": "*", "blocked": "!", "idle": ".",
+                "shell": ".", "bar_full": "#", "bar_empty": "-", "sep": "-", "dot": "*"}
     encoding = sys.stdout.encoding or "utf-8"
     try:
-        "\u25b6\u2713\u00b7\u2588\u2591\u2500\u25cf".encode(encoding)
+        "\u25b6\u2713\u00b7\u2588\u2591\u2500\u25cf\u203a".encode(encoding)
     except (LookupError, UnicodeEncodeError):
-        return {"running": ">", "finished": "*", "shell": ".", "bar_full": "#",
-                "bar_empty": "-", "sep": "-", "dot": "*"}
-    return {"running": "\u25b6", "finished": "\u2713", "shell": "\u00b7",
-            "bar_full": "\u2588", "bar_empty": "\u2591", "sep": "\u2500",
-            "dot": "\u25cf"}
+        return {"running": ">", "finished": "*", "blocked": "!", "idle": ".",
+                "shell": ".", "bar_full": "#", "bar_empty": "-", "sep": "-", "dot": "*"}
+    return {"running": "\u25b6", "finished": "\u2713", "blocked": "!",
+            "idle": "\u203a", "shell": "\u00b7", "bar_full": "\u2588",
+            "bar_empty": "\u2591", "sep": "\u2500", "dot": "\u25cf"}
 
 
 GLYPH = _pick_glyphs()
+
+
+# --------------------------------------------------------------------------
+# ANSI parsing and screen classification
+# --------------------------------------------------------------------------
+
+# A parsed style is a tuple: (fg, bg, bold, dim, italic, underline, reverse),
+# where fg/bg are xterm-256 color indices or -1 for the terminal default.
+DEFAULT_SGR = (-1, -1, 0, 0, 0, 0, 0)
+
+_CUBE = (0, 95, 135, 175, 215, 255)
+_BASE_RGB = ((0, 0, 0), (205, 0, 0), (0, 205, 0), (205, 205, 0),
+             (0, 0, 238), (205, 0, 205), (0, 205, 205), (229, 229, 229))
+
+
+def _rgb_to_xterm(r, g, b):
+    ri = min(range(6), key=lambda i: abs(_CUBE[i] - r))
+    gi = min(range(6), key=lambda i: abs(_CUBE[i] - g))
+    bi = min(range(6), key=lambda i: abs(_CUBE[i] - b))
+    cube = 16 + 36 * ri + 6 * gi + bi
+    cube_rgb = (_CUBE[ri], _CUBE[gi], _CUBE[bi])
+    average = (r + g + b) / 3
+    gray_i = max(0, min(23, int(round((average - 8) / 10))))
+    gray = 8 + 10 * gray_i
+    cube_dist = sum((a - b) ** 2 for a, b in zip((r, g, b), cube_rgb))
+    gray_dist = sum((v - gray) ** 2 for v in (r, g, b))
+    return 232 + gray_i if gray_dist < cube_dist else cube
+
+
+def _xterm_to_rgb(index):
+    if 16 <= index <= 231:
+        index -= 16
+        return (_CUBE[index // 36], _CUBE[(index % 36) // 6], _CUBE[index % 6])
+    if 232 <= index <= 255:
+        value = 8 + 10 * (index - 232)
+        return (value, value, value)
+    if 0 <= index < 8:
+        return _BASE_RGB[index]
+    if 8 <= index < 16:
+        return _BASE_RGB[index - 8]
+    return (0, 0, 0)
+
+
+def _nearest_base_color(r, g, b):
+    return min(range(8), key=lambda i: sum((a - c) ** 2
+                                           for a, c in zip((r, g, b), _BASE_RGB[i])))
+
+
+def _apply_sgr(style, params):
+    codes = [int(part) if part else 0 for part in params.split(";")] if params else [0]
+    index = 0
+    while index < len(codes):
+        code = codes[index]
+        if code == 0:
+            style[:] = list(DEFAULT_SGR)
+        elif code == 1:
+            style[2] = 1
+        elif code == 2:
+            style[3] = 1
+        elif code == 3:
+            style[4] = 1
+        elif code == 4:
+            style[5] = 1
+        elif code == 7:
+            style[6] = 1
+        elif code == 22:
+            style[2] = style[3] = 0
+        elif code == 23:
+            style[4] = 0
+        elif code == 24:
+            style[5] = 0
+        elif code == 27:
+            style[6] = 0
+        elif 30 <= code <= 37:
+            style[0] = code - 30
+        elif code == 39:
+            style[0] = -1
+        elif 40 <= code <= 47:
+            style[1] = code - 40
+        elif code == 49:
+            style[1] = -1
+        elif 90 <= code <= 97:
+            style[0] = code - 90 + 8
+        elif 100 <= code <= 107:
+            style[1] = code - 100 + 8
+        elif code in (38, 48):
+            target = 0 if code == 38 else 1
+            if index + 1 < len(codes) and codes[index + 1] == 5 and index + 2 < len(codes):
+                style[target] = max(0, min(255, codes[index + 2]))
+                index += 2
+            elif index + 1 < len(codes) and codes[index + 1] == 2 and index + 4 < len(codes):
+                style[target] = _rgb_to_xterm(codes[index + 2], codes[index + 3],
+                                              codes[index + 4])
+                index += 4
+        index += 1
+
+
+def parse_sgr(line):
+    """Split a captured line into (text, style) runs.
+
+    Only SGR styling is interpreted; every other escape sequence is consumed
+    and discarded, and control characters become spaces, so untrusted pane
+    output can never reach the terminal as raw bytes.
+    """
+    runs, buf, style = [], [], list(DEFAULT_SGR)
+
+    def flush():
+        if buf:
+            runs.append(("".join(buf), tuple(style)))
+            buf.clear()
+
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
+        if ch == "\x1b" and i + 1 < n and line[i + 1] == "[":
+            flush()
+            j = i + 2
+            while j < n and not ("@" <= line[j] <= "~"):
+                j += 1
+            if j < n:
+                if line[j] == "m":
+                    _apply_sgr(style, line[i + 2:j])
+                i = j + 1
+            else:
+                i = n
+            continue
+        if ch == "\x1b" and i + 1 < n and line[i + 1] == "]":
+            flush()
+            j = i + 2
+            while j < n:
+                if line[j] == "\x07":
+                    j += 1
+                    break
+                if line[j] == "\x1b" and j + 1 < n and line[j + 1] == "\\":
+                    j += 2
+                    break
+                j += 1
+            i = j
+            continue
+        if ch == "\x1b":
+            flush()
+            i += 2
+            continue
+        buf.append(ch if ch.isprintable() else " " if ch != "\t" else " ")
+        i += 1
+    flush()
+    return runs
+
+
+def _sgr_prefix(style):
+    """Canonical, safe SGR prefix (reset + recognized attributes only)."""
+    fg, bg, bold, dim, italic, underline, reverse = style
+    parts = ["0"]
+    if bold:
+        parts.append("1")
+    if dim:
+        parts.append("2")
+    if italic:
+        parts.append("3")
+    if underline:
+        parts.append("4")
+    if reverse:
+        parts.append("7")
+    if fg >= 0:
+        parts.append(f"38;5;{fg}")
+    if bg >= 0:
+        parts.append(f"48;5;{bg}")
+    return "\x1b[" + ";".join(parts) + "m"
+
+
+def render_ansi(lines, color):
+    """Plain text or safe ANSI reconstruction of captured lines."""
+    output = []
+    for line in lines:
+        runs = parse_sgr(line)
+        if not color:
+            output.append("".join(text for text, _ in runs))
+        else:
+            body = "".join(_sgr_prefix(style) + text for text, style in runs)
+            output.append(body + "\x1b[0m")
+    return output
+
+
+class AnsiRenderer:
+    """Maps parsed SGR styles onto curses attributes and cached color pairs."""
+
+    def __init__(self):
+        self.colors = curses.COLORS if curses.has_colors() else 0
+        self.pairs = getattr(curses, "COLOR_PAIRS", 0)
+        self.enabled = (self.colors >= 8 and not os.environ.get("NO_COLOR"))
+        self._pairs = {}
+        # Pairs 1-7 are reserved by setup_styles(); start our own well above them.
+        self._next = 8
+
+    def _clamp(self, index):
+        if self.colors >= 256:
+            return max(0, min(self.colors - 1, index))
+        if index < 8:
+            return index
+        if index < 16:
+            return index - 8
+        return _nearest_base_color(*_xterm_to_rgb(index))
+
+    def _pair(self, fg, bg):
+        key = (fg, bg)
+        if key in self._pairs:
+            return self._pairs[key]
+        if self._next >= self.pairs:
+            return 0
+        try:
+            a = self._clamp(fg) if fg >= 0 else -1
+            b = self._clamp(bg) if bg >= 0 else -1
+            curses.init_pair(self._next, a, b)
+            self._pairs[key] = self._next
+            self._next += 1
+        except curses.error:
+            return 0
+        return self._pairs[key]
+
+    def attr(self, style):
+        fg, bg, bold, dim, italic, underline, reverse = style
+        attr = 0
+        if bold:
+            attr |= curses.A_BOLD
+        if dim:
+            attr |= curses.A_DIM
+        if underline:
+            attr |= curses.A_UNDERLINE
+        if reverse:
+            attr |= curses.A_REVERSE
+        if not self.enabled or (fg < 0 and bg < 0):
+            return attr
+        return attr | curses.color_pair(self._pair(fg, bg))
+
+
+# Screen-state heuristics. These are intentionally conservative and can be
+# extended without touching the code: AGMUX_BLOCKED_PATTERNS and
+# AGMUX_WORKING_PATTERNS are '|'-joined regular expressions appended here.
+_BLOCKED_PATTERNS = [
+    r"\[y/n\]", r"\(y/n\)", r"\[Y/n\]", r"\[y/N\]", r"\byes/no\b",
+    r"\ballow\b[^.]*\b(run|command|access|edit|write|execute|this|once|always)\b",
+    r"\b(approve|approval|permit|permission)\b",
+    r"\bwould you like to\b", r"\bdo you want to\b", r"\bare you sure\b",
+    r"\bproceed\?", r"\bcontinue\?", r"\boverwrite\?", r"\bconfirm\?",
+    r"\bpress (enter|y)\b[^.]*\b(confirm|continue|approve|allow|deny)",
+    r"\bescalat", r"\bneeds? (your )?(input|approval|permission)\b",
+    r"^\s*(?:[>\u276f]|\d+[.)])\s*(?:yes|allow|approve|deny|no)\b",
+    r"\b(would|do|does|shall|should|can|could|may)\b[^?]{0,120}\?\s*$",
+]
+_WORKING_PATTERNS = [
+    r"esc to interrupt", r"\besc\b[^.]*\binterrupt\b", r"ctrl\+c to (cancel|stop|interrupt)",
+    r"press esc[^.]*\b(stop|cancel|interrupt)\b", r"working\s*(?:\(|\u2022|\.\.\.)",
+    r"thinking\s*(?:\(|\u2022|\.\.\.)", r"esc replaces",
+]
+
+
+def _compile_patterns(defaults, extra_env):
+    patterns = list(defaults)
+    extra = os.environ.get(extra_env)
+    if extra:
+        patterns.extend(part for part in extra.split("|") if part)
+    compiled = []
+    for pattern in patterns:
+        try:
+            compiled.append(re.compile(pattern, re.IGNORECASE))
+        except re.error:
+            continue
+    return compiled
+
+
+def classify_screen(lines, limit=24):
+    """Return (state, prompt) where state is blocked, working, or idle.
+
+    ``prompt`` is the screen line that looked like it needs the user.
+    """
+    tail = [line.rstrip() for line in lines[-limit:] if line.strip()]
+    blocked = _compile_patterns(_BLOCKED_PATTERNS, "AGMUX_BLOCKED_PATTERNS")
+    working = _compile_patterns(_WORKING_PATTERNS, "AGMUX_WORKING_PATTERNS")
+    for line in reversed(tail):
+        for pattern in blocked:
+            if pattern.search(line):
+                return "blocked", line.strip()[:200]
+    joined = "\n".join(tail)
+    for pattern in working:
+        if pattern.search(joined):
+            return "working", ""
+    return "idle", ""
+
+
+_BOX_CHARS = set(chr(code) for code in range(0x2500, 0x25A0)) | \
+    {" ", ".", "\u00b7", "\u2b1d"}
+
+# Agents draw a fixed input composer and status footer at the bottom of their
+# TUIs. It is the same every time and hides real output, so previews drop it.
+_CODEX_COMPOSER = re.compile(r"^[\u203a\u276f>]\s")
+_CODEX_STATUS = re.compile(r"\b(?:xhigh|high|medium|low|minimal)\b\s*\u00b7")
+
+
+def _classify_chrome(agent, line):
+    """Return 'strong', 'weak', or None for one trailing preview line."""
+    text = line.rstrip()
+    stripped = text.strip()
+    if not stripped:
+        return "weak"
+    if agent == "codex":
+        if _CODEX_COMPOSER.match(stripped):
+            return "strong"
+        if "for shortcuts" in stripped or "for agents" in stripped or "to view" in stripped:
+            return "strong"
+        if _CODEX_STATUS.search(stripped):
+            return "strong"
+        if stripped[0] in "\u2514\u2517\u2570":  # tip / corner bullets
+            return "weak"
+        return None
+    if agent == "opencode":
+        if "esc interrupt" in stripped or "ctrl+p commands" in stripped:
+            return "strong"
+        if re.search(r"\b(?:Build|Plan|Agent)\b", stripped) and "\u00b7" in stripped:
+            return "weak"
+        if all(ch in _BOX_CHARS for ch in stripped):
+            return "weak"
+        return None
+    return None
+
+
+def trim_chrome(agent, lines):
+    """Drop a trailing block of agent input/status chrome, if one is present.
+
+    Only a contiguous run of recognized chrome (with at least one strong
+    footer/composer line) is removed, so unknown screens and shell sessions are
+    left untouched apart from trailing blank lines. Set ``AGMUX_TRIM_CHROME=0``
+    to disable trimming.
+    """
+    if os.environ.get("AGMUX_TRIM_CHROME", "1").strip().lower() in ("0", "false", "no", "off"):
+        end = len(lines)
+        while end > 0 and not lines[end - 1].strip():
+            end -= 1
+        return lines[:end]
+    end = len(lines)
+    strong = False
+    while end > 0:
+        kind = _classify_chrome(agent, lines[end - 1])
+        if kind is None:
+            break
+        strong = strong or kind == "strong"
+        end -= 1
+    if strong:
+        return lines[:end]
+    end = len(lines)
+    while end > 0 and not lines[end - 1].strip():
+        end -= 1
+    return lines[:end]
 
 
 # --------------------------------------------------------------------------
@@ -333,24 +689,40 @@ class Tmux:
                              unread=int(unread or 0), finished=int(finished or 0)))
         return sorted(rows, key=lambda row: (-row["activity"], row["name"]))
 
-    def session_details(self):
+    def session_details(self, detect=False):
         rows = self.sessions()
         if not rows:
             return []
         fmt = "\t".join("#{" + key + "}" for key in
                         ("session_id", "window_active", "pane_active",
-                         "pane_current_command", "pane_current_path"))
+                         "pane_current_command", "pane_current_path", "pane_id"))
         active = {}
         for line in self.run("list-panes", "-a", "-F", fmt, optional=True).splitlines():
-            fields = line.split("\t", 4)
-            if len(fields) == 5 and fields[1:3] == ["1", "1"]:
-                active[fields[0]] = fields[3:]
+            fields = line.split("\t", 5)
+            if len(fields) == 6 and fields[1:3] == ["1", "1"]:
+                active[fields[0]] = dict(process=fields[3], cwd=fields[4], pane=fields[5])
         for row in rows:
-            row["process"], row["cwd"] = active.get(row["id"], ["", ""])
+            info = active.get(row["id"], {"process": "", "cwd": "", "pane": ""})
+            row["process"] = info["process"]
+            row["cwd"] = info["cwd"]
+            row["pane"] = info["pane"]
+            row["state"] = ""
+            row["prompt"] = ""
             if not row["agent"]:
                 detected = detect_agent(row["process"])
                 row["agent"] = detected.key if detected else ""
+            if (detect and row["agent"] and row["agent"] != "shell" and row["pane"]
+                    and row["process"] not in SHELL_COMMANDS):
+                try:
+                    state, prompt = classify_screen(self.pane_lines(row["pane"]))
+                except Error:
+                    state, prompt = "", ""
+                row["state"], row["prompt"] = state, prompt
         return rows
+
+    def pane_lines(self, target, lines=24):
+        """Visible screen text of a pane (target may be a pane id or 'session:')."""
+        return self.run("capture-pane", "-p", "-t", target, "-S", f"-{lines}").splitlines()
 
     def resolve(self, target):
         rows = self.sessions()
@@ -385,7 +757,7 @@ class Tmux:
             raise Error("Cannot identify the current tmux session.")
         return self.run("display-message", "-p", "-t", pane, "#{session_id}")
 
-    def preview(self, sid, height=16):
+    def preview(self, sid, height=16, ansi=False):
         fmt = "\t".join("#{" + key + "}" for key in
                         ("pane_id", "window_active", "pane_active",
                          "pane_current_command", "pane_current_path"))
@@ -394,11 +766,16 @@ class Tmux:
         active = next((p for p in panes if len(p) == 5 and p[1:3] == ["1", "1"]), None)
         if not active:
             return ["No active pane"]
-        output = self.run("capture-pane", "-p", "-t", active[0], "-S", f"-{height}")
-        return [f"{active[3]}  |  {active[4]}", ""] + output.splitlines()[-height:]
+        # Capture extra rows so trimming the agent's input/status footer still
+        # leaves a full preview of real content.
+        depth = height + 12
+        output = self.run("capture-pane", "-p", *(["-e"] if ansi else []),
+                          "-t", active[0], "-S", f"-{depth}")
+        return [f"{active[3]}  |  {active[4]}", ""] + output.splitlines()[-depth:]
 
     def connect(self, sid, client=None):
         self.mark_read(sid)
+        self.cancel_modes(sid)
         client = self.client(client)
         if os.environ.get("TMUX") or client:
             args = ["switch-client", "-t", sid]
@@ -419,6 +796,19 @@ class Tmux:
             self.session_option(sid, "agmux_unread", "0")
         except Error:
             pass
+
+    def cancel_modes(self, sid):
+        """Leave copy-mode (or similar) so a switch/attach lands on the live view.
+
+        Uses ``send-keys -X cancel``, which exits the mode without typing into
+        the running program. Panes that are not in a mode are left untouched.
+        """
+        fmt = "#{pane_id}\t#{pane_in_mode}"
+        for line in self.run("list-panes", "-s", "-t", sid, "-F", fmt,
+                             optional=True).splitlines():
+            pane, _, mode = line.partition("\t")
+            if mode == "1":
+                self.run("send-keys", "-t", pane, "-X", "cancel", optional=True)
 
     def create(self, name, cwd, agent=DEFAULT_AGENT, agent_args=(), notify=True):
         validate_name(name)
@@ -549,7 +939,8 @@ def fuzzy(query, value):
 
 def searchable(row):
     agent = AGENTS.get(row.get("agent") or "")
-    return " ".join(str(row.get(key, "")) for key in ("name", "cwd", "process", "status")) + \
+    return " ".join(str(row.get(key, "")) for key in
+                    ("name", "cwd", "process", "status", "state", "prompt")) + \
         (" " + agent.label if agent else "")
 
 
@@ -576,17 +967,33 @@ def default_name(directory, sessions, agent=DEFAULT_AGENT):
 
 
 def row_status(row):
-    """running, finished, or shell - from tracked options or detection."""
-    if row.get("unread"):
+    """blocked, finished, running, idle, or shell.
+
+    ``blocked`` means the agent looks like it is waiting on the user (a
+    permission or confirmation prompt); ``idle`` means it is alive but at its
+    prompt rather than working.
+    """
+    if row.get("unread") or row.get("status") == "finished":
         return "finished"
-    status = row.get("status")
-    if status == "finished":
-        return "finished"
-    if status == "running":
+    state = row.get("state")
+    if state == "blocked":
+        return "blocked"
+    if state == "working":
+        return "running"
+    if state == "idle":
+        return "idle" if row.get("agent") and row["agent"] != "shell" else "shell"
+    if row.get("status") == "running":
         return "running"
     if row.get("agent") and row["agent"] != "shell":
         return "running"
     return "shell"
+
+
+_STATUS_ORDER = {"blocked": 0, "finished": 1, "running": 2, "idle": 3, "shell": 4}
+
+
+def state_priority(row):
+    return _STATUS_ORDER.get(row_status(row), 5)
 
 
 # --------------------------------------------------------------------------
@@ -599,13 +1006,8 @@ def notify_default():
     return value not in ("0", "false", "no", "off")
 
 
-def send_notification(label, session, exit_code, seconds, enabled):
+def _run_notification(title, body, session, exit_code=-1):
     """Best-effort desktop/terminal notice. Never blocks or raises."""
-    if not enabled:
-        return
-    title = f"{label} finished"
-    outcome = "completed" if exit_code == 0 else f"exited (code {exit_code})"
-    body = f"{session}: {outcome} in {humanize_delta(seconds)}"
     custom = os.environ.get("AGMUX_NOTIFY_CMD")
     if custom:
         try:
@@ -616,12 +1018,49 @@ def send_notification(label, session, exit_code, seconds, enabled):
                 return
         except (ValueError, OSError):
             pass
-    if shutil.which("notify-send") and (_env("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS")):
+    if shutil.which("notify-send") and _env("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"):
         try:
             subprocess.Popen(["notify-send", "-a", APP, "-u", "normal", title, body],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             pass
+
+
+def send_notification(label, session, exit_code, seconds, enabled):
+    """Notify that an agent finished."""
+    if not enabled:
+        return
+    outcome = "completed" if exit_code == 0 else f"exited (code {exit_code})"
+    _run_notification(f"{label} finished", f"{session}: {outcome} in {humanize_delta(seconds)}",
+                      session, exit_code)
+
+
+def send_blocked_notification(label, session, prompt, enabled=True):
+    """Notify that an agent is waiting on the user (permission or question)."""
+    if not enabled:
+        return
+    _run_notification(f"{label} needs input", f"{session}: {prompt}", session)
+
+
+def watch_interval():
+    try:
+        return max(1.0, float(os.environ.get("AGMUX_WATCH_INTERVAL", "3") or 3))
+    except ValueError:
+        return 3.0
+
+
+def watch_blocked(tmux, sid, label, session, stop_event, interval):
+    """While an agent runs, poll its pane and notify on a new blocked prompt."""
+    last_prompt = None
+    while not stop_event.wait(interval):
+        try:
+            lines = tmux.pane_lines(f"{sid}:")
+        except Error:
+            continue
+        state, prompt = classify_screen(lines)
+        if state == "blocked" and prompt and prompt != last_prompt:
+            last_prompt = prompt
+            send_blocked_notification(label, session, prompt)
 
 
 def launch_agent(agent_key, executable, shell, session, arguments, notify_enabled):
@@ -654,6 +1093,11 @@ def launch_agent(agent_key, executable, shell, session, arguments, notify_enable
 
     started = time.time()
     code = 0
+    stop_event = threading.Event()
+    if tmux and sid and notify_enabled:
+        threading.Thread(target=watch_blocked,
+                         args=(tmux, sid, profile.label, session, stop_event, watch_interval()),
+                         daemon=True).start()
     try:
         child = subprocess.Popen([executable, *arguments])
         while True:
@@ -668,6 +1112,7 @@ def launch_agent(agent_key, executable, shell, session, arguments, notify_enable
     except OSError as error:
         print(f"{APP}: {clean(error)}", file=sys.stderr)
         code = 127
+    stop_event.set()
 
     elapsed = time.time() - started
     set_option("agmux_status", "finished")
@@ -760,6 +1205,25 @@ def put_right(screen, y, value, attr=0):
     put(screen, y, max(0, width - len(clean(value)) - 1), value, attr)
 
 
+def put_runs(screen, y, runs, renderer, x=0, limit=None):
+    """Draw parsed (text, style) runs, mapping styles through the renderer."""
+    height, width = screen.getmaxyx()
+    if not (0 <= y < height):
+        return
+    edge = width - 1 if limit is None else min(width - 1, limit)
+    for text, style in runs:
+        if x >= edge:
+            break
+        text = clean(text)
+        if not text:
+            continue
+        try:
+            screen.addnstr(y, x, text, edge - x, renderer.attr(style))
+        except curses.error:
+            pass
+        x += len(text)
+
+
 def prompt(screen, label, initial="", style=None):
     style = style or Style()
     value = initial
@@ -797,18 +1261,21 @@ def prompt(screen, label, initial="", style=None):
 def viewer(screen, tmux, row, style=None):
     """Read tmux's existing output; never attach or forward input to a pane."""
     style = style or Style()
-    offset, refreshed, lines = 0, 0.0, []
+    renderer = AnsiRenderer()
+    offset, refreshed, body, caption = 0, 0.0, [], ""
     screen.timeout(200)
     while True:
         height, width = screen.getmaxyx()
         now = time.monotonic()
         if now - refreshed > 2:
             try:
-                lines = tmux.preview(row["id"], 500)
+                lines = tmux.preview(row["id"], 500, ansi=True)
+                caption = lines[0] if lines else ""
+                content = trim_chrome(row.get("agent"), lines[2:])
+                body = [parse_sgr(line) for line in content]
             except Error as error:
-                lines = [str(error), ""]
+                caption, body = str(error), []
             refreshed = now
-        body = lines[2:]
         visible = max(1, height - 5)
         offset = max(0, min(offset, max(0, len(body) - visible)))
         start = max(0, len(body) - visible - offset)
@@ -816,9 +1283,9 @@ def viewer(screen, tmux, row, style=None):
         put(screen, 0, 0, f"Read-only output: {row['name']}", style.heading)
         put(screen, 1, 0, "Up/Down/PageUp/PageDown scroll | Home oldest | End live | Esc back",
             style.help)
-        put(screen, 2, 0, lines[0] if lines else "", style.muted)
-        for index, line in enumerate(body[start:start + visible]):
-            put(screen, 3 + index, 0, line)
+        put(screen, 2, 0, caption, style.muted)
+        for index, runs in enumerate(body[start:start + visible]):
+            put_runs(screen, 3 + index, runs, renderer)
         put(screen, height - 1, 0, "Live tail" if not offset else f"{offset} lines above live tail",
             style.muted)
         screen.refresh()
@@ -860,7 +1327,9 @@ def show_help(screen, style=None):
              "Ctrl-P: show/hide pane preview",
              "Ctrl-L: refresh immediately; Ctrl-U: clear the search",
              "Esc: cancel; F1: help", "",
+             "Sessions whose agent needs input are flagged and sorted first.",
              "Sessions whose agent finishes get a check mark and a notification.",
+             "Previews and the viewer show the pane's own colors and styles.",
              "Deleting ends a live session and its programs; project files stay on disk.",
              "This helper reads local tmux output, directory names, and Codex usage",
              "logs. It has no telemetry and makes no network requests.", "",
@@ -984,12 +1453,16 @@ def confirm_delete(screen, tmux, info, style=None):
 
 def draw_row(screen, y, row, selected, style):
     status = row_status(row)
-    glyph = {"finished": GLYPH["finished"], "running": GLYPH["running"]}.get(status, GLYPH["shell"])
-    glyph_role = {"finished": "finished", "running": "attached"}.get(status, "muted")
+    glyph = {"finished": GLYPH["finished"], "running": GLYPH["running"],
+             "blocked": GLYPH["blocked"], "idle": GLYPH["idle"]}.get(status, GLYPH["shell"])
+    glyph_role = {"finished": "finished", "running": "attached",
+                  "blocked": "warning", "idle": "muted"}.get(status, "muted")
     segments = [(glyph + " ", glyph_role), (row["name"], "name")]
     agent = AGENTS.get(row.get("agent") or "")
     if agent and not agent.is_shell:
         segments.append(("  " + agent.label, agent.accent))
+    if status == "blocked":
+        segments.append(("  needs input", "warning"))
     segments.append((f"  {row['windows']}w", "muted"))
     if row["attached"]:
         segments.append(("  attached", "attached"))
@@ -1107,16 +1580,18 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True):
         pass
     query, selection, selected_id = "", 0, None
     rows, refreshed, message, message_alert = [], 0.0, "", False
-    preview, preview_key, preview_at = [], None, 0.0
+    preview_key, preview_at = None, 0.0
+    preview_caption, preview_body = "", []
+    renderer = AnsiRenderer()
     while True:
         now = time.monotonic()
         if now - refreshed > 2:
             try:
-                rows = tmux.session_details()
+                rows = tmux.session_details(detect=True)
             except Error as error:
                 rows, message, message_alert = [], str(error), True
             refreshed = now
-        ordered = sorted(rows, key=lambda r: (0 if r["unread"] else 1, -r["activity"], r["name"]))
+        ordered = sorted(rows, key=lambda r: (state_priority(r), -r["activity"], r["name"]))
         matches = [row for row in ordered if fuzzy(query, searchable(row))]
         # Preserve selection across refreshes and narrowing the filter.
         if selected_id:
@@ -1137,11 +1612,16 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True):
                 pass
             continue
         screen.erase()
-        running = sum(1 for row in rows if row_status(row) == "running")
-        finished = sum(1 for row in rows if row_status(row) == "finished")
+        statuses = [row_status(row) for row in rows]
+        running = statuses.count("running")
+        finished = statuses.count("finished")
+        blocked = statuses.count("blocked")
+        summary = f"{len(rows)} sessions \u00b7 {running} running"
+        if blocked:
+            summary += f" \u00b7 {blocked} need input"
+        summary += f" \u00b7 {finished} done"
         put(screen, 0, 0, f"{APP} {VERSION}", style.heading)
-        put_right(screen, 0, f"{len(rows)} sessions \u00b7 {running} running \u00b7 "
-                            f"{finished} done", style.muted)
+        put_right(screen, 0, summary, style.warning if blocked else style.muted)
         usage = usage_inline()
         if usage:
             put(screen, 1, 0, usage, style.muted)
@@ -1164,12 +1644,23 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True):
             if selected:
                 if selected_id != preview_key or now - preview_at > 2:
                     try:
-                        preview = tmux.preview(selected_id, max(1, height - preview_y - 4))
+                        lines = tmux.preview(selected_id, max(1, height - preview_y - 6),
+                                             ansi=True)
+                        preview_caption = lines[0] if lines else ""
+                        content = trim_chrome(selected.get("agent"), lines[2:])
+                        preview_body = [parse_sgr(line) for line in content]
                     except Error as error:
-                        preview = [str(error)]
+                        preview_caption, preview_body = str(error), []
                     preview_key, preview_at = selected_id, now
-                for index, line in enumerate(preview[:max(0, height - preview_y - 2)]):
-                    put(screen, preview_y + index, 0, line)
+                put(screen, preview_y, 0, preview_caption, style.muted)
+                offset = 1
+                if row_status(selected) == "blocked" and selected.get("prompt"):
+                    put(screen, preview_y + offset, 0,
+                        "! needs input: " + selected["prompt"], style.warning)
+                    offset += 1
+                room = max(0, height - preview_y - offset - 1)
+                for index, runs in enumerate(preview_body[-room:] if room else []):
+                    put_runs(screen, preview_y + offset + index, runs, renderer)
         footer = (message or f"{len(matches)} of {len(rows)} sessions   "
                   "Enter attach \u00b7 Ctrl-N new \u00b7 Ctrl-R rename \u00b7 "
                   "Ctrl-D delete \u00b7 F1 help")
@@ -1274,15 +1765,16 @@ def interactive(tmux, client=None, show_preview=True, notify=True):
 
 
 def list_lines(tmux, enabled):
-    for row in tmux.session_details():
+    for row in tmux.session_details(detect=True):
         agent = AGENTS.get(row.get("agent") or "")
         status = row_status(row)
-        glyph = {"finished": GLYPH["finished"], "running": GLYPH["running"]}.get(
-            status, GLYPH["shell"])
+        glyph = {"finished": GLYPH["finished"], "running": GLYPH["running"],
+                 "blocked": GLYPH["blocked"], "idle": GLYPH["idle"]}.get(status, GLYPH["shell"])
+        role = {"finished": "finished", "running": "attached",
+                "blocked": "warning", "idle": "muted"}.get(status, "muted")
         name = f"{clean(row['name']):<28}"
         state = f"{'attached' if row['attached'] else 'detached':<8}"
-        segments = [(f"{glyph} ", {"finished": "finished", "running": "attached"}.get(
-            status, "muted")), (name, "heading")]
+        segments = [(f"{glyph} ", role), (name, "heading")]
         if agent and not agent.is_shell:
             segments.append((f"{agent.label:<8}", agent.accent))
         else:
@@ -1290,7 +1782,9 @@ def list_lines(tmux, enabled):
         segments.append((f"{state}  ", "attached" if row["attached"] else "muted"))
         segments.append((f"{clean(row.get('process', '')):<10} ", "default"))
         segments.append((short_path(row.get("cwd", "")), "muted"))
-        if row["unread"]:
+        if status == "blocked" and row.get("prompt"):
+            segments.append(("  needs input: " + row["prompt"][:100], "warning"))
+        elif row["unread"]:
             segments.append(("  " + GLYPH["finished"], "finished"))
         print(paint_segments(segments, enabled))
 
@@ -1309,8 +1803,33 @@ def doctor(tmux):
         print(f"  {agent.label:<9} {found or 'missing'}")
     print(f"Notifications: {'on' if notify_default() else 'off'}"
           f"{'' if shutil.which('notify-send') else ' (notify-send not found)'}")
+    print(f"Watch interval: {watch_interval()}s")
     print(f"Sessions: {len(tmux.sessions())}")
     print(f"Usage data: {'available' if codex_usage(0) else 'none found'}")
+
+
+def watch_command(tmux, interval, once=False, notify_enabled=True):
+    """Poll sessions and report when an agent starts waiting on the user."""
+    previous = {}
+    while True:
+        try:
+            rows = tmux.session_details(detect=True)
+        except Error as error:
+            print(f"{APP}: {clean(error)}", file=sys.stderr)
+            rows = []
+        for row in rows:
+            status = row_status(row)
+            if status == "blocked" and previous.get(row["id"]) != "blocked":
+                agent = AGENTS.get(row.get("agent") or "")
+                label = agent.label if agent and not agent.is_shell \
+                    else (row.get("process") or "agent")
+                prompt = row.get("prompt") or "waiting for input"
+                print(f"{clean(row['name'])}: {clean(label)} needs input - {clean(prompt)}")
+                send_blocked_notification(label, row["name"], prompt, notify_enabled)
+            previous[row["id"]] = status
+        if once:
+            return 0
+        time.sleep(interval)
 
 
 def build_parser():
@@ -1352,6 +1871,10 @@ def build_parser():
     sub.add_parser("kill", help="alias for delete").add_argument("session")
     sub.add_parser("usage", help="show locally available provider usage limits")
     sub.add_parser("agents", help="list known agents and whether they are installed")
+    watch = sub.add_parser("watch", help="notify when an agent needs input")
+    watch.add_argument("--interval", type=float, default=watch_interval(),
+                       help="seconds between checks (default: %(default)s)")
+    watch.add_argument("--once", action="store_true", help="check once and exit")
     preview = sub.add_parser("preview", help="show recent output from the active pane")
     preview.add_argument("session")
     peek = sub.add_parser("peek", help="read-only live output viewer without attaching")
@@ -1468,8 +1991,18 @@ def main(argv=None):
         for text, role in usage_report(width=24):
             print(paint(text, role, enabled))
     elif args.command == "preview":
-        print("\n".join(clean(line) for line in
-                        tmux.preview(tmux.resolve(args.session)["id"])))
+        enabled = color_enabled()
+        sid = tmux.resolve(args.session)["id"]
+        agent = next((row.get("agent") for row in tmux.session_details(detect=True)
+                      if row["id"] == sid), None)
+        lines = tmux.preview(sid, ansi=enabled)
+        if lines:
+            print(clean(lines[0]))
+        for line in render_ansi(trim_chrome(agent, lines[2:]), enabled):
+            print(line)
+    elif args.command == "watch":
+        return watch_command(tmux, args.interval, once=args.once,
+                             notify_enabled=not args.no_notify)
     elif args.command == "peek":
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             raise Error(f"The viewer requires a terminal. Use {APP} preview for text output.")

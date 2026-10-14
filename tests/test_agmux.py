@@ -98,6 +98,16 @@ class TmuxIntegration(unittest.TestCase):
         self.tmux.mark_read(sid)
         self.assertEqual(self.tmux.resolve(sid)["unread"], 0)
 
+    def test_cancel_modes_clears_copy_mode(self):
+        sid = self.tmux.create("moded", self.root, agent="shell")
+        pane = self.tmux.run("list-panes", "-s", "-t", sid, "-F", "#{pane_id}")
+        self.tmux.run("copy-mode", "-t", pane)
+        self.assertEqual(self.tmux.run("display-message", "-p", "-t", pane, "#{pane_in_mode}"), "1")
+        self.tmux.cancel_modes(sid)
+        self.assertEqual(self.tmux.run("display-message", "-p", "-t", pane, "#{pane_in_mode}"), "0")
+        # A session with no active modes is left alone without error.
+        self.tmux.cancel_modes(sid)
+
     def test_detects_agent_from_foreground_command(self):
         bin_dir = self.root / "openbin"
         bin_dir.mkdir()
@@ -385,6 +395,110 @@ class AgentMetadata(unittest.TestCase):
         self.assertEqual(agmux.humanize_delta(90), "1m")
         self.assertEqual(agmux.humanize_delta(3600), "1h")
         self.assertEqual(agmux.humanize_delta(3660), "1h01m")
+
+
+class AnsiAndState(unittest.TestCase):
+    def test_parse_sgr_extracts_style_runs(self):
+        runs = agmux.parse_sgr("\x1b[1;31mred bold\x1b[0m plain")
+        self.assertEqual(runs[0][0], "red bold")
+        self.assertEqual(runs[0][1][0], 1)   # red foreground
+        self.assertEqual(runs[0][1][2], 1)   # bold
+        self.assertEqual(runs[1][0], " plain")
+        self.assertEqual(runs[1][1], agmux.DEFAULT_SGR)
+
+    def test_parse_sgr_strips_non_sgr_controls(self):
+        runs = agmux.parse_sgr("a\x1b[2Jb\x1b]0;title\x07c\x1b[38;2;255;0;0mred")
+        text = "".join(part for part, _ in runs)
+        self.assertNotIn("\x1b", text)
+        self.assertIn("abc", text)
+        self.assertEqual(runs[-1][1][0], agmux._rgb_to_xterm(255, 0, 0))
+
+    def test_parse_sgr_handles_256_and_default_colors(self):
+        runs = agmux.parse_sgr("\x1b[38;5;196mx\x1b[39m\x1b[48;5;17my")
+        self.assertEqual(runs[0][1][0], 196)
+        self.assertEqual(runs[1][1][0], -1)
+        self.assertEqual(runs[1][1][1], 17)
+
+    def test_render_ansi_plain_and_colored(self):
+        line = "\x1b[31mred\x1b[0m"
+        self.assertEqual(agmux.render_ansi([line], False), ["red"])
+        colored = agmux.render_ansi([line], True)[0]
+        self.assertIn("red", colored)
+        # Only canonical SGR is re-emitted; the original bytes never pass through.
+        self.assertNotIn("\x1b[31m", colored)
+        self.assertIn("38;5;1", colored)
+
+    def test_classify_screen(self):
+        self.assertEqual(agmux.classify_screen(["\u2022 Working (3s \u2022 esc to interrupt)"])[0],
+                         "working")
+        self.assertEqual(agmux.classify_screen(["Allow command?", "> 1. Yes", "  2. No"])[0],
+                         "blocked")
+        self.assertEqual(agmux.classify_screen(["[y/N] proceed"])[0], "blocked")
+        self.assertEqual(agmux.classify_screen(["Would you like to run this command?"])[0],
+                         "blocked")
+        self.assertEqual(agmux.classify_screen(["\u203a Ask Codex to do anything"])[0], "idle")
+        state, prompt = agmux.classify_screen(["Do you want to allow this?"])
+        self.assertEqual(state, "blocked")
+        self.assertTrue(prompt)
+
+    def test_row_status_prefers_screen_state(self):
+        self.assertEqual(agmux.row_status({"agent": "codex", "state": "blocked"}), "blocked")
+        self.assertEqual(agmux.row_status({"agent": "codex", "state": "working"}), "running")
+        self.assertEqual(agmux.row_status({"agent": "codex", "state": "idle"}), "idle")
+        self.assertEqual(agmux.row_status({"agent": "shell", "state": "idle"}), "shell")
+        self.assertEqual(agmux.row_status({"agent": "codex", "status": "finished"}), "finished")
+
+    def test_state_ordering_puts_blocked_first(self):
+        rows = [{"agent": "codex", "state": "idle"},
+                {"agent": "codex", "state": "blocked"},
+                {"unread": 1},
+                {"agent": "codex", "state": "working"}]
+        ordered = sorted(rows, key=agmux.state_priority)
+        self.assertEqual(agmux.state_priority(ordered[0]), 0)
+        self.assertEqual(agmux.row_status(ordered[0]), "blocked")
+
+    def test_trim_chrome_codex(self):
+        lines = ["assistant output here", "",
+                 "\u2022 Working (3s \u2022 esc to interrupt)", "",
+                 "\u203a Ask Codex to do anything", "",
+                 "  GPT-6.1-Sol xhigh \u00b7 ~/source/repos/skyhook \u00b7 Review",
+                 "  \u2190 for agents \u00b7 ? for shortcuts        \u26a0 4 warnings \u00b7 f2 to view"]
+        trimmed = agmux.trim_chrome("codex", lines)
+        joined = "\n".join(trimmed)
+        self.assertIn("assistant output here", joined)
+        self.assertIn("Working", joined)          # status line is kept
+        self.assertNotIn("Ask Codex", joined)
+        self.assertNotIn("for shortcuts", joined)  # footer is dropped
+        self.assertNotIn("xhigh", joined)
+
+    def test_trim_chrome_opencode(self):
+        lines = ["tool output", "",
+                 "  \u2503", "  \u2503",
+                 "  \u2503  Build \u00b7 DeepSeek V4.1 Flash \u00b7 high",
+                 "  \u2579\u2580\u2580\u2580\u2580\u2580",
+                 "   \u2b1d\u25a0\u25a0\u25a0\u25a0\u2b1d esc interrupt   88.4K (9%) \u00b7 $0.02  ctrl+p commands"]
+        trimmed = agmux.trim_chrome("opencode", lines)
+        joined = "\n".join(trimmed)
+        self.assertIn("tool output", joined)
+        self.assertNotIn("esc interrupt", joined)
+        self.assertNotIn("Build \u00b7", joined)
+
+    def test_trim_chrome_leaves_shell_alone(self):
+        lines = ["$ ls -la", "total 0", "$ echo hi", "", ""]
+        self.assertEqual(agmux.trim_chrome("shell", lines), ["$ ls -la", "total 0", "$ echo hi"])
+        self.assertEqual(agmux.trim_chrome(None, ["plain", "text"]), ["plain", "text"])
+
+    def test_trim_chrome_can_be_disabled(self):
+        lines = ["content", "  \u203a Ask Codex to do anything", ""]
+        with patch.dict(os.environ, {"AGMUX_TRIM_CHROME": "0"}):
+            self.assertEqual(agmux.trim_chrome("codex", lines),
+                             ["content", "  \u203a Ask Codex to do anything"])
+
+    def test_trim_chrome_keeps_unknown_footers(self):
+        # A screen with no recognized strong footer is only blank-trimmed.
+        lines = ["content", "\u2503", "\u2503", ""]
+        self.assertEqual(agmux.trim_chrome("opencode", lines),
+                         ["content", "\u2503", "\u2503"])
 
 
 class Usage(unittest.TestCase):

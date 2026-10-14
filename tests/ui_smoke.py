@@ -93,7 +93,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         tmux('new-session', '-d', '-s', 'beta', '-c', directory)
         tmux('source-file', str(TMUX_CONF))
         master, proc = launch([sys.executable, str(MODULE)])
-        wait_output(master, b'agmux 0.2.0')
+        wait_output(master, b'agmux 0.')
         os.write(master, b'beta')
         time.sleep(0.3)
         os.write(master, b'\x12')
@@ -131,7 +131,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         wait_client(master, 'alpha')
         wait_client(other_master, 'alpha')
         os.write(master, b'\x02\x13')
-        wait_output(master, b'agmux 0.2.0')
+        wait_output(master, b'agmux 0.')
         os.write(master, b'beta')
         time.sleep(0.3)
         os.write(master, b'\r')
@@ -151,7 +151,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         print('PASS: two-client isolation, popup switching, and last-session navigation')
 
         master, proc = launch([sys.executable, str(MODULE), '--no-preview'])
-        wait_output(master, b'agmux 0.2.0')
+        wait_output(master, b'agmux 0.')
         os.write(master, b'\x1bOP')  # F1 in xterm application mode
         wait_output(master, b'keyboard help')
         os.write(master, b'\r')
@@ -172,7 +172,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         print('PASS: help, usage panel, preview toggle, and in-picker read-only viewer')
 
         master, proc = launch([sys.executable, str(MODULE)])
-        wait_output(master, b'agmux 0.2.0')
+        wait_output(master, b'agmux 0.')
         os.write(master, b'\x0e')
         wait_output(master, b'choose what to run')
         os.write(master, b'\r')
@@ -201,7 +201,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         tmux('new-session', '-d', '-s', 'victim', '-c', directory)
         tmux('new-session', '-d', '-s', 'bystander', '-c', directory)
         master, proc = launch([sys.executable, str(MODULE)])
-        wait_output(master, b'agmux 0.2.0')
+        wait_output(master, b'agmux 0.')
         os.write(master, b'victim')
         time.sleep(0.3)
         os.write(master, b'\x04')  # Ctrl-D: open the deletion confirmation
