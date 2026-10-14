@@ -1,4 +1,4 @@
-.TH AGMUX 1 "2026" "agmux 0.5.0" "User Commands"
+.TH AGMUX 1 "2026" "agmux 0.5.1" "User Commands"
 .SH NAME
 agmux \- a terminal control panel for tmux and AI coding agents
 .SH SYNOPSIS
@@ -9,6 +9,14 @@ agmux \- a terminal control panel for tmux and AI coding agents
 lists and manages tmux sessions that run AI coding agents such as Codex,
 OpenCode, or Claude Code, and plain shells. It is a single, dependency\-free
 Python file that reads local tmux metadata and makes no network requests.
+.PP
+Each session line shows
+.B cpu X%
+and
+.B mem Y
+for that session: the machine CPU and RAM used by its processes. These are not
+token, context\-window, or rate\-limit figures; those appear in the usage panel
+(Rate limits and session cost are read locally).
 .PP
 Run with no command to open the picker. Type to filter, use Up/Down to select,
 and press Enter to attach (or switch your current tmux client).

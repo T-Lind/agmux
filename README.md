@@ -9,19 +9,23 @@ terminal.
 ![The agmux picker: sessions with agent state, a live preview, and per-session CPU and memory](docs/screenshot.svg)
 
 ```
-agmux 0.5.0                    5 sessions · 2 running · 1 need input · 1 done
-Codex · 5h 12% · 7d 34%      OpenCode 392K tok · $0.27      Ctrl-G details
+agmux 0.5.1                     5 sessions · 2 running · 1 need input · 1 done
+Codex · 5h 12% · 7d 34%       OpenCode 392K tok · $0.27        Ctrl-G details
 Search:
-! ty-review   Codex    2w  needs input  12% 486M  codex  ~/source/repos/ty   2m
-▶ upgrades-4  Codex    2w  attached     37% 611M  codex  ~/source/repos/ty   4m
-▶ opencode-ty OpenCode 1w                4% 228M  bun    ~/source/repos/ty   4s
-✓ agmux       OpenCode 1w                1% 233M  bun    ~/source/repos/agmux 12m ✓
-· scratch     Shell    1w                0%  12M  vim    ~/notes             1h
-──────────────────────────────────────────────────────────────────────────────
+! ty-review    Codex    2w  needs input  cpu 12% · mem 486M  codex  ~/source/repos/ty     2m
+▶ upgrades-4   Codex    2w  attached     cpu 37% · mem 611M  codex  ~/source/repos/ty     4m
+▶ opencode-ty  OpenCode 1w                cpu  4% · mem 228M  bun    ~/source/repos/ty     4s
+✓ agmux        OpenCode 1w                cpu  1% · mem 233M  bun    ~/source/repos/agmux  12m ✓
+· scratch      Shell    1w                cpu  0% · mem  12M  vim    ~/notes               1h
+──────────────────────────────────────────────────────────────────────────────────────────
 codex  |  ~/source/repos/ty
 ! needs input: Allow command?  1. Yes  2. Yes, and don't ask again  3. No
 1 of 5 sessions   Enter attach · Ctrl-N new · Ctrl-R rename · Ctrl-D delete · F1 help
 ```
+
+Here `cpu` is the machine's CPU usage and `mem` is resident RAM — both for the
+session's own processes, **not** token, context-window, or rate-limit usage
+(those are the percentages in the line above, from `Ctrl-G`).
 
 ## Why
 
@@ -35,8 +39,9 @@ questions and stays out of the way.
   binaries you already have. No pip, no plugins, no daemon, no network.
 - **Agent-aware.** Knows Codex, OpenCode, Claude Code, Gemini, Aider, Crush, and
   Goose, and can launch any of them — or a plain shell — in a tmux session.
-- **Resource use per session.** A compact `CPU%` and memory figure next to each
-  session, summed across all of that session's panes and their child processes.
+- **Resource use per session.** A labelled `cpu X% · mem Y` figure next to each
+  session, summed across all of that session's panes and their child processes —
+  machine CPU and RAM, kept visually distinct from token and rate-limit usage.
 - **Tells you when it's done.** Agent sessions started by agmux are flagged
   `✓` when they finish and fire a desktop notification.
 - **Tells you when it needs you.** If an agent is waiting on a permission or
@@ -149,11 +154,13 @@ labelled even if agmux did not start it.
 
 ### CPU and memory per session
 
-Each row shows `CPU%` and resident memory for the whole session: the active
-process in every pane plus its descendants. It is sampled once per refresh from
-`ps` (pid, parent, CPU%, RSS only), so one query covers every session, and is
-off by default on platforms without a compatible `ps`. Set `AGMUX_RESOURCES=0`
-or pass `--no-resources` to hide it. In JSON it is `cpu` (percent) and `rss`
+Each row shows `cpu X%` and `mem Y` for the whole session: the active process in
+every pane plus its descendants. The `cpu` and `mem` words are deliberate —
+these are the machine's CPU and RAM used by that session, not token,
+context-window, or rate-limit figures. It is sampled once per refresh from `ps`
+(pid, parent, CPU%, RSS only), so one query covers every session, and is off by
+default on platforms without a compatible `ps`. Set `AGMUX_RESOURCES=0` or pass
+`--no-resources` to hide it. In JSON the fields are `cpu` (percent) and `rss`
 (kibibytes):
 
 ```bash

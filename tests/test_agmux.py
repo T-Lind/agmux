@@ -705,9 +705,14 @@ class Resources(unittest.TestCase):
         self.assertEqual(agmux.humanize_size(300 * 1024), "300M")
         self.assertEqual(agmux.humanize_size(2 * 1024 * 1024), "2.0G")
         self.assertEqual(agmux.resource_label(0, 0), "")
-        self.assertEqual(agmux.resource_label(12.4, 1024), "12% 1.0M")
-        self.assertEqual(agmux.resource_label(0.1, 1024), "1.0M")
-        self.assertEqual(agmux.resource_label(3.0, 0), "3%")
+        self.assertEqual(agmux.resource_label(12.4, 1024), "cpu 12% \u00b7 mem 1.0M")
+        self.assertEqual(agmux.resource_label(0.1, 1024), "mem 1.0M")
+        self.assertEqual(agmux.resource_label(3.0, 0), "cpu 3%")
+        # The label must say what it is, so it reads as machine use and not as
+        # token or context-window usage.
+        label = agmux.resource_label(12.4, 1024)
+        self.assertIn("cpu", label)
+        self.assertIn("mem", label)
 
     def test_process_usage_sums_only_the_tree(self):
         table = {

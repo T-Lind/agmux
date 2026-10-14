@@ -4,6 +4,14 @@ All notable changes to agmux are documented here. The format is loosely based
 on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [semantic versioning](https://semver.org/).
 
+## [0.5.1]
+
+### Changed
+- Label the per-session resource figures explicitly as `cpu X%` and `mem Y`
+  everywhere (picker, `agmux list`, screenshot), so they read as machine CPU and
+  RAM rather than token, context-window, or rate-limit usage. Help text and the
+  README say so outright.
+
 ## [0.5.0]
 
 ### Added
@@ -38,4 +46,5 @@ on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 ## [0.2.0]
 - Agent-aware tmux session manager.
 
+[0.5.1]: https://github.com/T-Lind/agmux/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/T-Lind/agmux/compare/v0.4.0...v0.5.0

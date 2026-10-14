@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - sqlite3 is in the standard library
 
 
 APP = "agmux"
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 SELF = Path(__file__).resolve()
 
 
@@ -875,15 +875,17 @@ def process_usage(root_pids, table=None):
 
 
 def resource_label(cpu, rss):
-    """A short ``12% 340M`` style label, or empty when there is nothing to show."""
-    if not rss and not cpu:
-        return ""
+    """A short, unambiguous ``cpu 12% · mem 340M`` label, or empty.
+
+    The words are deliberate: this is this machine's CPU and memory for the
+    session's processes, not token or rate-limit usage.
+    """
     parts = []
     if cpu and cpu >= 0.5:
-        parts.append(f"{cpu:.0f}%")
+        parts.append(f"cpu {cpu:.0f}%")
     if rss:
-        parts.append(humanize_size(rss))
-    return " ".join(parts)
+        parts.append(f"mem {humanize_size(rss)}")
+    return " \u00b7 ".join(parts)
 
 
 # --------------------------------------------------------------------------
@@ -1635,7 +1637,8 @@ def show_help(screen, style=None):
              "Sessions whose agent finishes get a check mark and a notification.",
              "Previews and the viewer show the pane's own colors and styles, with the",
              "newest output at the bottom even if the pane has been scrolled up.",
-             "The CPU% and memory next to a session cover all of its panes' processes.",
+             "cpu X% and mem Y are this machine's CPU and RAM used by the session's",
+             "processes - not token, context-window, or rate-limit usage.",
              "Deleting ends a live session and its programs; project files stay on disk.",
              "This helper reads local tmux output, directory names, and Codex usage",
              "logs. It has no telemetry and makes no network requests.", "",
@@ -2106,9 +2109,9 @@ def list_line(row, enabled):
     state = f"{'attached' if row['attached'] else 'detached':<8}"
     segments = [(f"{glyph} ", role), (name, "heading")]
     if agent and not agent.is_shell:
-        segments.append((f" {agent.label:<8}", agent.accent))
+        segments.append((f" {agent.label:<9}", agent.accent))
     else:
-        segments.append((f" {'-':<8}", "muted"))
+        segments.append((f" {'-':<9}", "muted"))
     segments.append((f"{state}  ", "attached" if row["attached"] else "muted"))
     segments.append((f"{clean(row.get('process', '')):<10} ", "default"))
     segments.append((short_path(row.get("cwd", "")), "muted"))
