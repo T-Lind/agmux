@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - sqlite3 is in the standard library
 
 
 APP = "agmux"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 SELF = Path(__file__).resolve()
 
 
@@ -40,7 +40,66 @@ def _env(*names, default=None):
     return default
 
 
-ROOT = Path(_env("AGMUX_REPOS", "CX_REPOS", default=str(Path.home() / "source/repos")))
+# Machine-local defaults from an optional config file, so the same settings can
+# follow you across machines (via dotfiles) without exporting variables by hand.
+# Environment variables always win over the file, and the file is optional.
+_CONFIG_KEYS = {
+    "repos": "AGMUX_REPOS",
+    "agent": "AGMUX_AGENT",
+    "default_agent": "AGMUX_AGENT",
+    "tmux_socket": "AGMUX_TMUX_SOCKET",
+    "notify": "AGMUX_NOTIFY",
+    "notify_cmd": "AGMUX_NOTIFY_CMD",
+    "watch_interval": "AGMUX_WATCH_INTERVAL",
+    "blocked_patterns": "AGMUX_BLOCKED_PATTERNS",
+    "working_patterns": "AGMUX_WORKING_PATTERNS",
+    "trim_chrome": "AGMUX_TRIM_CHROME",
+    "resources": "AGMUX_RESOURCES",
+    "ascii": "AGMUX_ASCII",
+    "bin": "AGMUX_BIN",
+    "codex_home": "CODEX_HOME",
+    "opencode_data_dir": "OPENCODE_DATA_DIR",
+}
+
+
+def config_path():
+    """Where agmux looks for its optional ``key = value`` config file."""
+    explicit = os.environ.get("AGMUX_CONFIG")
+    if explicit:
+        return Path(explicit).expanduser()
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    return base / APP / "config"
+
+
+def load_config(path=None):
+    """Apply defaults from the config file, if present.
+
+    Values are written into the environment only when the matching variable is
+    not already set, so the shell (and CI) always override the file. A line is
+    a comment when it starts with ``#``; blank lines and unknown keys are
+    ignored. Returns the settings applied.
+    """
+    source = Path(path) if path is not None else config_path()
+    try:
+        text = source.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    applied = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        env_name = _CONFIG_KEYS.get(key.strip().lower().replace("-", "_"))
+        if not env_name or env_name in os.environ:
+            continue
+        os.environ[env_name] = value.strip().strip("'\"")
+        applied[env_name] = os.environ[env_name]
+    return applied
+
+
+load_config()
+
 CODEX_HOME = Path(_env("CODEX_HOME", default=str(Path.home() / ".codex")))
 OPENCODE_HOME = Path(_env("OPENCODE_DATA_DIR", default=str(
     Path(_env("XDG_DATA_HOME", default=str(Path.home() / ".local/share"))) / "opencode")))
@@ -743,6 +802,91 @@ def usage_report(width=20, limits=None, opencode=None):
 
 
 # --------------------------------------------------------------------------
+# Per-session resource use (CPU and memory across each pane's process tree)
+# --------------------------------------------------------------------------
+
+# One ``ps`` sample serves every session and is reused across a short window so
+# a picker refresh does not fork a process per row. Falls back to no data when
+# the platform has no compatible ``ps``.
+_PS_CACHE = {"at": 0.0, "data": None}
+
+
+def resources_enabled():
+    value = os.environ.get("AGMUX_RESOURCES", "1").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def humanize_size(kilobytes):
+    """A compact memory size from a value in kibibytes."""
+    value = max(0.0, float(kilobytes or 0))
+    if value < 1024:
+        return f"{value:.0f}K"
+    mb = value / 1024
+    if mb < 1024:
+        return f"{mb:.0f}M" if mb >= 10 else f"{mb:.1f}M"
+    return f"{mb / 1024:.1f}G"
+
+
+def _process_table(max_age=1.5):
+    """pid -> (ppid, cpu_percent, rss_kib), sampled once and cached briefly."""
+    now = time.monotonic()
+    if _PS_CACHE["data"] is not None and now - _PS_CACHE["at"] <= max_age:
+        return _PS_CACHE["data"]
+    table = {}
+    try:
+        result = subprocess.run(["ps", "-eo", "pid=,ppid=,pcpu=,rss="], text=True,
+                                errors="replace", stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=4)
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 4:
+                continue
+            try:
+                table[int(fields[0])] = (int(fields[1]), float(fields[2]), int(fields[3]))
+            except ValueError:
+                continue
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        table = {}
+    _PS_CACHE["at"], _PS_CACHE["data"] = now, table
+    return table
+
+
+def process_usage(root_pids, table=None):
+    """(cpu_percent, rss_kib) summed over a set of process trees."""
+    table = _process_table() if table is None else table
+    if not table:
+        return 0.0, 0
+    children = {}
+    for pid, (ppid, _, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    cpu = rss = 0.0
+    seen = set()
+    stack = [pid for pid in root_pids if pid in table]
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        _, pcpu, rss_kib = table[pid]
+        cpu += pcpu
+        rss += rss_kib
+        stack.extend(children.get(pid, ()))
+    return cpu, int(rss)
+
+
+def resource_label(cpu, rss):
+    """A short ``12% 340M`` style label, or empty when there is nothing to show."""
+    if not rss and not cpu:
+        return ""
+    parts = []
+    if cpu and cpu >= 0.5:
+        parts.append(f"{cpu:.0f}%")
+    if rss:
+        parts.append(humanize_size(rss))
+    return " ".join(parts)
+
+
+# --------------------------------------------------------------------------
 # tmux
 # --------------------------------------------------------------------------
 
@@ -790,7 +934,7 @@ class Tmux:
                              unread=int(unread or 0), finished=int(finished or 0)))
         return sorted(rows, key=lambda row: (-row["activity"], row["name"]))
 
-    def session_details(self, detect=False):
+    def session_details(self, detect=False, resources=False):
         rows = self.sessions()
         if not rows:
             return []
@@ -802,6 +946,7 @@ class Tmux:
             fields = line.split("\t", 5)
             if len(fields) == 6 and fields[1:3] == ["1", "1"]:
                 active[fields[0]] = dict(process=fields[3], cwd=fields[4], pane=fields[5])
+        usage = self.session_resources() if resources else {}
         for row in rows:
             info = active.get(row["id"], {"process": "", "cwd": "", "pane": ""})
             row["process"] = info["process"]
@@ -809,6 +954,7 @@ class Tmux:
             row["pane"] = info["pane"]
             row["state"] = ""
             row["prompt"] = ""
+            row["cpu"], row["rss"] = usage.get(row["id"], (0.0, 0))
             if not row["agent"]:
                 detected = detect_agent(row["process"])
                 row["agent"] = detected.key if detected else ""
@@ -820,6 +966,26 @@ class Tmux:
                     state, prompt = "", ""
                 row["state"], row["prompt"] = state, prompt
         return rows
+
+    def pane_pids(self):
+        """session_id -> list of pane process ids, from one tmux query."""
+        pids = {}
+        fmt = "#{session_id}\t#{pane_pid}"
+        for line in self.run("list-panes", "-a", "-F", fmt, optional=True).splitlines():
+            session_id, _, pid = line.partition("\t")
+            try:
+                pids.setdefault(session_id, []).append(int(pid))
+            except ValueError:
+                continue
+        return pids
+
+    def session_resources(self):
+        """session_id -> (cpu_percent, rss_kib), summed over each pane's tree."""
+        table = _process_table()
+        if not table:
+            return {}
+        return {sid: process_usage(pids, table) for sid, pids in self.pane_pids().items()}
+
 
     def pane_lines(self, target, lines=24):
         """Visible screen text of a pane (target may be a pane id or 'session:')."""
@@ -868,11 +1034,14 @@ class Tmux:
         if not active:
             return ["No active pane"]
         # Capture extra rows so trimming the agent's input/status footer still
-        # leaves a full preview of real content.
+        # leaves a full preview of real content. ``-E -`` pins the range to the
+        # end of the pane's history, so previews always end on the newest output
+        # even if a client has scrolled the pane into copy mode.
         depth = height + 12
         output = self.run("capture-pane", "-p", *(["-e"] if ansi else []),
-                          "-t", active[0], "-S", f"-{depth}")
+                          "-t", active[0], "-S", f"-{depth}", "-E", "-")
         return [f"{active[3]}  |  {active[4]}", ""] + output.splitlines()[-depth:]
+
 
     def connect(self, sid, client=None):
         self.mark_read(sid)
@@ -1045,10 +1214,42 @@ def searchable(row):
         (" " + agent.label if agent else "")
 
 
+def repos_roots():
+    """The configured project roots, newest syntax: one or more directories.
+
+    ``AGMUX_REPOS`` may list several roots separated by ``os.pathsep`` (``:``
+    on Linux); ``~`` is expanded. Falls back to ``~/source/repos``.
+    """
+    raw = _env("AGMUX_REPOS", "CX_REPOS", default=str(Path.home() / "source" / "repos"))
+    roots = []
+    for part in raw.split(os.pathsep):
+        part = part.strip()
+        if not part:
+            continue
+        path = Path(part).expanduser()
+        if path not in roots:
+            roots.append(path)
+    return roots
+
+
 def repos():
-    if not ROOT.is_dir():
-        raise Error(f"Repository directory does not exist: {ROOT}. Set AGMUX_REPOS to change it.")
-    return [dict(id=str(p), name=p.name) for p in sorted(ROOT.iterdir()) if p.is_dir()]
+    found, seen = [], set()
+    roots = repos_roots()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+            if not path.is_dir():
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            found.append(dict(id=str(path), name=path.name))
+    if not found and not any(root.is_dir() for root in roots):
+        raise Error("No repository directory exists: "
+                    f"{', '.join(str(root) for root in roots)}. Set AGMUX_REPOS to change it.")
+    return sorted(found, key=lambda repo: repo["name"].lower())
 
 
 def short_path(directory):
@@ -1380,13 +1581,15 @@ def viewer(screen, tmux, row, style=None):
         visible = max(1, height - 5)
         offset = max(0, min(offset, max(0, len(body) - visible)))
         start = max(0, len(body) - visible - offset)
+        block = body[start:start + visible]
         screen.erase()
         put(screen, 0, 0, f"Read-only output: {row['name']}", style.heading)
         put(screen, 1, 0, "Up/Down/PageUp/PageDown scroll | Home oldest | End live | Esc back",
             style.help)
         put(screen, 2, 0, caption, style.muted)
-        for index, runs in enumerate(body[start:start + visible]):
-            put_runs(screen, 3 + index, runs, renderer)
+        top = 3 + max(0, visible - len(block))
+        for index, runs in enumerate(block):
+            put_runs(screen, top + index, runs, renderer)
         put(screen, height - 1, 0, "Live tail" if not offset else f"{offset} lines above live tail",
             style.muted)
         screen.refresh()
@@ -1430,7 +1633,9 @@ def show_help(screen, style=None):
              "Esc: cancel; F1: help", "",
              "Sessions whose agent needs input are flagged and sorted first.",
              "Sessions whose agent finishes get a check mark and a notification.",
-             "Previews and the viewer show the pane's own colors and styles.",
+             "Previews and the viewer show the pane's own colors and styles, with the",
+             "newest output at the bottom even if the pane has been scrolled up.",
+             "The CPU% and memory next to a session cover all of its panes' processes.",
              "Deleting ends a live session and its programs; project files stay on disk.",
              "This helper reads local tmux output, directory names, and Codex usage",
              "logs. It has no telemetry and makes no network requests.", "",
@@ -1567,6 +1772,9 @@ def draw_row(screen, y, row, selected, style):
     segments.append((f"  {row['windows']}w", "muted"))
     if row["attached"]:
         segments.append(("  attached", "attached"))
+    resource = resource_label(row.get("cpu"), row.get("rss"))
+    if resource:
+        segments.append(("  " + resource, "secondary"))
     if row.get("process"):
         segments.append(("  " + clean(row["process"]), "default"))
     if row.get("cwd"):
@@ -1671,7 +1879,7 @@ def new_session_flow(screen, tmux, style, notify=True):
     return dict(id=sid, name=name)
 
 
-def picker(screen, tmux, show_preview=True, style=None, notify=True):
+def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=True):
     style = style or setup_styles()
     screen.keypad(True)
     screen.timeout(200)
@@ -1688,7 +1896,7 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True):
         now = time.monotonic()
         if now - refreshed > 2:
             try:
-                rows = tmux.session_details(detect=True)
+                rows = tmux.session_details(detect=True, resources=resources)
             except Error as error:
                 rows, message, message_alert = [], str(error), True
             refreshed = now
@@ -1764,8 +1972,12 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True):
                         "! needs input: " + selected["prompt"], style.warning)
                     offset += 1
                 room = max(0, height - preview_y - offset - 1)
-                for index, runs in enumerate(preview_body[-room:] if room else []):
-                    put_runs(screen, preview_y + offset + index, runs, renderer)
+                visible = preview_body[-room:] if room else []
+                # Hug the bottom of the preview area, matching a real terminal:
+                # short content sits at the bottom instead of floating at the top.
+                top = preview_y + offset + max(0, room - len(visible))
+                for index, runs in enumerate(visible):
+                    put_runs(screen, top + index, runs, renderer)
         footer = (message or f"{len(matches)} of {len(rows)} sessions   "
                   "Enter attach \u00b7 Ctrl-N new \u00b7 Ctrl-R rename \u00b7 "
                   "Ctrl-D delete \u00b7 F1 help")
@@ -1852,7 +2064,7 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True):
             query += key
 
 
-def interactive(tmux, client=None, show_preview=True, notify=True):
+def interactive(tmux, client=None, show_preview=True, notify=True, resources=True):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise Error(f"The picker requires a terminal. Use {APP} list for text output.")
     try:
@@ -1860,7 +2072,8 @@ def interactive(tmux, client=None, show_preview=True, notify=True):
     except locale.Error:
         pass
     client = tmux.client(client)
-    selected = curses.wrapper(picker, tmux, show_preview=show_preview, notify=notify)
+    selected = curses.wrapper(picker, tmux, show_preview=show_preview, notify=notify,
+                              resources=resources)
     return tmux.connect(selected["id"], client) if selected else 0
 
 
@@ -1869,29 +2082,49 @@ def interactive(tmux, client=None, show_preview=True, notify=True):
 # --------------------------------------------------------------------------
 
 
-def list_lines(tmux, enabled):
-    for row in tmux.session_details(detect=True):
-        agent = AGENTS.get(row.get("agent") or "")
-        status = row_status(row)
-        glyph = {"finished": GLYPH["finished"], "running": GLYPH["running"],
-                 "blocked": GLYPH["blocked"], "idle": GLYPH["idle"]}.get(status, GLYPH["shell"])
-        role = {"finished": "finished", "running": "attached",
-                "blocked": "warning", "idle": "muted"}.get(status, "muted")
-        name = f"{clean(row['name']):<28}"
-        state = f"{'attached' if row['attached'] else 'detached':<8}"
-        segments = [(f"{glyph} ", role), (name, "heading")]
-        if agent and not agent.is_shell:
-            segments.append((f"{agent.label:<8}", agent.accent))
-        else:
-            segments.append((f"{'-':<8}", "muted"))
-        segments.append((f"{state}  ", "attached" if row["attached"] else "muted"))
-        segments.append((f"{clean(row.get('process', '')):<10} ", "default"))
-        segments.append((short_path(row.get("cwd", "")), "muted"))
-        if status == "blocked" and row.get("prompt"):
-            segments.append(("  needs input: " + row["prompt"][:100], "warning"))
-        elif row["unread"]:
-            segments.append(("  " + GLYPH["finished"], "finished"))
-        print(paint_segments(segments, enabled))
+def session_record(row):
+    """A stable, machine-readable view of one session."""
+    agent = AGENTS.get(row.get("agent") or "")
+    return dict(id=row["id"], name=row["name"], agent=row.get("agent") or "",
+                agent_label=agent.label if agent and not agent.is_shell else "",
+                status=row_status(row), state=row.get("state") or "",
+                attached=bool(row["attached"]), windows=row["windows"],
+                process=row.get("process") or "", cwd=row.get("cwd") or "",
+                cpu=round(float(row.get("cpu") or 0.0), 1), rss=row.get("rss") or 0,
+                prompt=row.get("prompt") or "", activity=row.get("activity"))
+
+
+def list_line(row, enabled):
+    """One human-readable session line (with optional color), as a string."""
+    agent = AGENTS.get(row.get("agent") or "")
+    status = row_status(row)
+    glyph = {"finished": GLYPH["finished"], "running": GLYPH["running"],
+             "blocked": GLYPH["blocked"], "idle": GLYPH["idle"]}.get(status, GLYPH["shell"])
+    role = {"finished": "finished", "running": "attached",
+            "blocked": "warning", "idle": "muted"}.get(status, "muted")
+    name = f"{clean(row['name']):<28}"
+    state = f"{'attached' if row['attached'] else 'detached':<8}"
+    segments = [(f"{glyph} ", role), (name, "heading")]
+    if agent and not agent.is_shell:
+        segments.append((f" {agent.label:<8}", agent.accent))
+    else:
+        segments.append((f" {'-':<8}", "muted"))
+    segments.append((f"{state}  ", "attached" if row["attached"] else "muted"))
+    segments.append((f"{clean(row.get('process', '')):<10} ", "default"))
+    segments.append((short_path(row.get("cwd", "")), "muted"))
+    resource = resource_label(row.get("cpu"), row.get("rss"))
+    if resource:
+        segments.append(("  " + resource, "secondary"))
+    if status == "blocked" and row.get("prompt"):
+        segments.append(("  needs input: " + row["prompt"][:100], "warning"))
+    elif row["unread"]:
+        segments.append(("  " + GLYPH["finished"], "finished"))
+    return paint_segments(segments, enabled)
+
+
+def list_lines(tmux, enabled, resources=True):
+    for row in tmux.session_details(detect=True, resources=resources):
+        print(list_line(row, enabled))
 
 
 def doctor(tmux):
@@ -1899,7 +2132,9 @@ def doctor(tmux):
     print(f"tmux: {tmux.run('-V')}")
     print(f"Helper: {SELF}")
     print(f"Inside tmux: {'yes' if os.environ.get('TMUX') else 'no'}")
-    print(f"Repositories: {ROOT}")
+    print(f"Repositories: {', '.join(str(path) for path in repos_roots())}")
+    print(f"Config file: {config_path()} "
+          f"({'present' if config_path().is_file() else 'not present'})")
     print(f"Default agent: {DEFAULT_AGENT}")
     for agent in AGENTS.values():
         if agent.is_shell:
@@ -1909,6 +2144,8 @@ def doctor(tmux):
     print(f"Notifications: {'on' if notify_default() else 'off'}"
           f"{'' if shutil.which('notify-send') else ' (notify-send not found)'}")
     print(f"Watch interval: {watch_interval()}s")
+    print(f"Resources: {'on' if resources_enabled() else 'off'}"
+          f"{'' if _process_table() else ' (ps unavailable)'}")
     print(f"Sessions: {len(tmux.sessions())}")
     print(f"Usage data: {'available' if codex_usage(0) else 'none found'}")
 
@@ -1944,12 +2181,16 @@ def build_parser():
                         help="start with pane previews hidden")
     parser.add_argument("--no-notify", action="store_true",
                         help="do not send a notification when an agent finishes")
+    parser.add_argument("--no-resources", action="store_true",
+                        help="do not sample per-session CPU and memory")
     sub = parser.add_subparsers(dest="command")
     pick = sub.add_parser("pick", help="search and select sessions (default)")
     pick.add_argument("--client", help=argparse.SUPPRESS)
     pick.add_argument("--no-preview", action="store_true", default=argparse.SUPPRESS,
                       help="start with pane previews hidden")
-    sub.add_parser("list", help="list running tmux sessions")
+    listing = sub.add_parser("list", help="list running tmux sessions")
+    listing.add_argument("--json", action="store_true",
+                         help="emit one JSON array with CPU and memory per session")
     sub.add_parser("ls", help="alias for list")
     sub.add_parser("names", help="print session names for shell completion")
     attach = sub.add_parser("attach", help="attach outside tmux; switch inside it")
@@ -2014,9 +2255,14 @@ def main(argv=None):
 
     parser = build_parser()
     agent_args = []
-    command_position = 1 if args_list[:1] == ["--no-preview"] else 0
-    if args_list[command_position:command_position + 1] == ["new"] and "--" in args_list:
-        divider = args_list.index("--")
+    # Skip leading global flags so a `new ... -- args` split still finds the
+    # subcommand even when it is not the first token.
+    index = 0
+    globals_ = ("--no-preview", "--no-notify", "--no-resources")
+    while index < len(args_list) and args_list[index] in globals_:
+        index += 1
+    if args_list[index:index + 1] == ["new"] and "--" in args_list[index:]:
+        divider = args_list.index("--", index)
         agent_args, args_list = args_list[divider + 1:], args_list[:divider]
     args = parser.parse_args(args_list)
     if args.command == "agents":
@@ -2029,12 +2275,19 @@ def main(argv=None):
     if not shutil.which("tmux"):
         raise Error("tmux is not installed.")
     tmux = Tmux()
+    resources = resources_enabled() and not args.no_resources
     if args.command in (None, "pick"):
         return interactive(tmux, getattr(args, "client", None),
                            show_preview=not args.no_preview,
-                           notify=not args.no_notify)
+                           notify=not args.no_notify, resources=resources)
     if args.command in ("list", "ls"):
-        list_lines(tmux, color_enabled())
+        rows = tmux.session_details(detect=True, resources=resources)
+        if getattr(args, "json", False):
+            print(json.dumps([session_record(row) for row in rows]))
+        else:
+            enabled = color_enabled()
+            for row in rows:
+                print(list_line(row, enabled))
     elif args.command == "names":
         for row in tmux.sessions():
             print(clean(row["name"]))

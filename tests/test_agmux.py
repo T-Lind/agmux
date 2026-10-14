@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 
 MODULE = Path(__file__).resolve().parents[1] / "agmux.py"
+# Never let a developer's real config file leak into the tests.
+os.environ.setdefault("AGMUX_CONFIG", os.devnull)
 spec = importlib.util.spec_from_file_location("agmux", MODULE)
 agmux = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(agmux)
@@ -365,6 +367,58 @@ class TmuxIntegration(unittest.TestCase):
         self.assertTrue(any(pane["path"] == str(directory) for pane in info["panes"]))
         self.assertEqual(sum(1 for pane in info["panes"] if pane["active"]), 1)
 
+    def test_session_resources_report_cpu_and_memory(self):
+        sid = self.tmux.create("busy", self.root, agent="shell")
+        self.tmux.run("respawn-pane", "-k", "-t", f"{sid}:", "/bin/sleep", "30")
+        usage = {}
+        for _ in range(100):
+            agmux._PS_CACHE["at"] = 0.0   # do not reuse a sample from a prior test
+            usage = self.tmux.session_resources()
+            if usage.get(sid, (0.0, 0))[1] > 0:
+                break
+            time.sleep(0.02)
+        self.assertIn(sid, usage)
+        cpu, rss = usage[sid]
+        self.assertGreaterEqual(cpu, 0.0)
+        self.assertGreater(rss, 0)   # any live process has resident memory
+        agmux._PS_CACHE["at"] = 0.0
+        row = next(r for r in self.tmux.session_details(resources=True) if r["id"] == sid)
+        self.assertGreater(row["rss"], 0)
+        # Without the flag there is no sampling and the fields stay zeroed.
+        row = next(r for r in self.tmux.session_details() if r["id"] == sid)
+        self.assertEqual((row["cpu"], row["rss"]), (0.0, 0))
+
+    def test_preview_ends_at_the_newest_output_when_scrolled_up(self):
+        sid = self.tmux.create("scrolly", self.root, agent="shell")
+        self.tmux.run("respawn-pane", "-k", "-t", f"{sid}:", "/bin/bash", "-c",
+                      "printf 'line-%03d\\n' $(seq 1 200); echo NEWEST_MARKER; sleep 30")
+        pane = self.tmux.run("list-panes", "-s", "-t", sid, "-F", "#{pane_id}")
+        for _ in range(100):
+            if "NEWEST_MARKER" in "\n".join(self.tmux.pane_lines(pane, 60)):
+                break
+            time.sleep(0.02)
+        # Scroll the pane far up into copy mode, as a user might while reading.
+        self.tmux.run("copy-mode", "-t", pane)
+        for _ in range(25):
+            self.tmux.run("send-keys", "-t", pane, "-X", "scroll-up")
+        self.assertEqual(self.tmux.run("display-message", "-p", "-t", pane,
+                                       "#{pane_in_mode}"), "1")
+        preview = self.tmux.preview(sid, 10)
+        self.assertIn("NEWEST_MARKER", "\n".join(preview))
+        self.assertNotIn("line-001", "\n".join(preview))
+
+    def test_list_json_records_cpu_memory_and_state(self):
+        self.tmux.create("json-row", self.root, agent="shell")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(agmux.main(["list", "--json"]), 0)
+        records = json.loads(output.getvalue())
+        row = next(record for record in records if record["name"] == "json-row")
+        self.assertEqual(row["status"], "shell")
+        self.assertIn("rss", row)
+        self.assertIn("cpu", row)
+        self.assertEqual(row["agent"], "shell")
+
 
 class AgentMetadata(unittest.TestCase):
     def test_detect_agent(self):
@@ -630,15 +684,95 @@ class Notifications(unittest.TestCase):
             self.assertTrue(agmux.notify_default())
 
     def test_launch_agent_records_and_execs_shell(self):
-        # os.execv is patched so the test process is preserved; tmux is absent
-        # from the environment, so status recording is a safe no-op.
+        # os.execv is patched so the test process is preserved, and Tmux is
+        # forced to fail so status recording is a safe no-op regardless of
+        # whether the suite itself runs inside tmux.
         with patch.object(agmux.os, "execv") as execv, \
-                patch.object(agmux.subprocess, "Popen") as popen:
+                patch.object(agmux.subprocess, "Popen") as popen, \
+                patch.object(agmux, "Tmux", side_effect=agmux.Error("no tmux")):
             popen.return_value.wait.return_value = None
             popen.return_value.returncode = 0
             agmux.launch_agent("codex", "/bin/true", "/bin/bash", "s1", ["--flag"], False)
         execv.assert_called_once_with("/bin/bash", ["/bin/bash", "-l"])
         popen.assert_called_once_with(["/bin/true", "--flag"])
+
+
+class Resources(unittest.TestCase):
+    def test_humanize_size_and_label(self):
+        self.assertEqual(agmux.humanize_size(0), "0K")
+        self.assertEqual(agmux.humanize_size(512), "512K")
+        self.assertEqual(agmux.humanize_size(2048), "2.0M")
+        self.assertEqual(agmux.humanize_size(300 * 1024), "300M")
+        self.assertEqual(agmux.humanize_size(2 * 1024 * 1024), "2.0G")
+        self.assertEqual(agmux.resource_label(0, 0), "")
+        self.assertEqual(agmux.resource_label(12.4, 1024), "12% 1.0M")
+        self.assertEqual(agmux.resource_label(0.1, 1024), "1.0M")
+        self.assertEqual(agmux.resource_label(3.0, 0), "3%")
+
+    def test_process_usage_sums_only_the_tree(self):
+        table = {
+            10: (1, 5.0, 100),
+            11: (10, 2.0, 50),
+            12: (11, 1.0, 25),
+            13: (1, 9.0, 999),   # unrelated sibling
+        }
+        cpu, rss = agmux.process_usage([10], table)
+        self.assertEqual(cpu, 8.0)
+        self.assertEqual(rss, 175)
+
+    def test_resources_toggle(self):
+        with patch.dict(os.environ, {"AGMUX_RESOURCES": "0"}):
+            self.assertFalse(agmux.resources_enabled())
+        with patch.dict(os.environ, {"AGMUX_RESOURCES": "1"}):
+            self.assertTrue(agmux.resources_enabled())
+
+
+class Config(unittest.TestCase):
+    def test_load_config_sets_unset_variables_only(self):
+        with tempfile.TemporaryDirectory(prefix="agmux-config-") as directory:
+            path = Path(directory) / "config"
+            path.write_text("# a comment\n"
+                            "repos = ~/work:~/code\n"
+                            "agent = opencode\n"
+                            "unknown = ignored\n"
+                            "resources = 0\n")
+            env = {k: v for k, v in os.environ.items() if k != "AGMUX_AGENT"}
+            env["AGMUX_REPOS"] = "/already/set"
+            with patch.dict(os.environ, env, clear=True):
+                applied = agmux.load_config(path)
+            self.assertEqual(applied.get("AGMUX_AGENT"), "opencode")
+            self.assertEqual(applied.get("AGMUX_RESOURCES"), "0")
+            self.assertNotIn("AGMUX_REPOS", applied)   # the environment wins
+
+    def test_repos_roots_splits_pathseps_and_expands_home(self):
+        value = f"~/a{os.pathsep}~/b{os.pathsep} ~/c "
+        with patch.dict(os.environ, {"AGMUX_REPOS": value}):
+            roots = agmux.repos_roots()
+        self.assertEqual(roots, [Path.home() / "a", Path.home() / "b", Path.home() / "c"])
+
+    def test_repos_merges_multiple_roots_without_duplicates(self):
+        with tempfile.TemporaryDirectory(prefix="agmux-repos-") as directory:
+            root = Path(directory)
+            first, second = root / "one", root / "two"
+            (first / "alpha").mkdir(parents=True)
+            (second / "beta").mkdir(parents=True)
+            # The same root listed twice must not duplicate its projects.
+            value = os.pathsep.join((str(first), str(first), str(second)))
+            with patch.dict(os.environ, {"AGMUX_REPOS": value}):
+                repos = agmux.repos()
+            self.assertEqual(sorted(repo["name"] for repo in repos), ["alpha", "beta"])
+            # Two roots may hold same-named projects; the path disambiguates.
+            (second / "alpha").mkdir()
+            with patch.dict(os.environ, {"AGMUX_REPOS": f"{first}{os.pathsep}{second}"}):
+                repos = agmux.repos()
+            self.assertEqual(sorted(repo["name"] for repo in repos),
+                             ["alpha", "alpha", "beta"])
+            self.assertEqual(len({repo["id"] for repo in repos}), 3)
+
+    def test_repos_reports_when_no_root_exists(self):
+        with patch.dict(os.environ, {"AGMUX_REPOS": "/nonexistent/agmux-repos"}):
+            with self.assertRaises(agmux.Error):
+                agmux.repos()
 
 
 if __name__ == "__main__":

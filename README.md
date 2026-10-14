@@ -1,78 +1,95 @@
 # agmux
 
 **A terminal control panel for tmux and AI coding agents.**
-One dependency-free Python file. Manage sessions, launch Codex / OpenCode /
-Claude Code / … , get told when an agent finishes, and see your usage limits —
-without leaving the terminal.
+One dependency-free Python file. Manage sessions running Codex / OpenCode /
+Claude Code / …, see their state and resource use, get told when an agent
+finishes or needs you, and check your usage limits — without leaving the
+terminal.
+
+![The agmux picker: sessions with agent state, a live preview, and per-session CPU and memory](docs/screenshot.svg)
 
 ```
-agmux 0.4.0           4 sessions · 1 running · 1 need input · 1 done
-Codex · 5h 12% · 7d 34%    OpenCode 392K tok · $0.27  Ctrl-G details
+agmux 0.5.0                    5 sessions · 2 running · 1 need input · 1 done
+Codex · 5h 12% · 7d 34%      OpenCode 392K tok · $0.27      Ctrl-G details
 Search:
-! ty-review   Codex    2w  needs input   codex  ~/source/repos/ty     2m
-▶ upgrades-4  Codex    2w  attached      codex  ~/source/repos/ty     4m
-✓ agmux       OpenCode 1w                bash   ~/source/repos/agmux  12m ✓
-· scratch     Shell    1w                vim    ~/notes               1h
-──────────────────────────────────────────────────────────────────────
+! ty-review   Codex    2w  needs input  12% 486M  codex  ~/source/repos/ty   2m
+▶ upgrades-4  Codex    2w  attached     37% 611M  codex  ~/source/repos/ty   4m
+▶ opencode-ty OpenCode 1w                4% 228M  bun    ~/source/repos/ty   4s
+✓ agmux       OpenCode 1w                1% 233M  bun    ~/source/repos/agmux 12m ✓
+· scratch     Shell    1w                0%  12M  vim    ~/notes             1h
+──────────────────────────────────────────────────────────────────────────────
 codex  |  ~/source/repos/ty
 ! needs input: Allow command?  1. Yes  2. Yes, and don't ask again  3. No
-1 of 4 sessions   Enter attach · Ctrl-N new · Ctrl-R rename · Ctrl-D delete · F1 help
+1 of 5 sessions   Enter attach · Ctrl-N new · Ctrl-R rename · Ctrl-D delete · F1 help
 ```
 
 ## Why
 
 tmux is excellent at keeping work alive remotely. It is less good at telling
-you *which* session holds which agent, whether that agent is still working, and
-whether you have blown through your rate limit. `agmux` is a small, auditable
-layer that answers those questions and stays out of the way.
+you *which* session holds which agent, whether that agent is still working,
+how much CPU and memory each session is burning, and whether you have blown
+through your rate limit. `agmux` is a small, auditable layer that answers those
+questions and stays out of the way.
 
 - **One file, no packages.** Standard library only, plus the `tmux` and agent
   binaries you already have. No pip, no plugins, no daemon, no network.
 - **Agent-aware.** Knows Codex, OpenCode, Claude Code, Gemini, Aider, Crush, and
   Goose, and can launch any of them — or a plain shell — in a tmux session.
+- **Resource use per session.** A compact `CPU%` and memory figure next to each
+  session, summed across all of that session's panes and their child processes.
 - **Tells you when it's done.** Agent sessions started by agmux are flagged
   `✓` when they finish and fire a desktop notification.
 - **Tells you when it needs you.** If an agent is waiting on a permission or
   confirmation prompt, agmux flags it `!`, sorts it to the top, and can notify
   you — so you are not left staring at a stalled session.
-- **Live previews in color.** The preview and the read-only viewer render the
-  pane's own colors and styles (parsed and re-emitted safely, never raw), and
-  trim the agent's input composer and status footer so you see real output.
+- **Live previews that stay current.** The preview and the read-only viewer
+  render the pane's own colors and styles, always end on the newest output even
+  if someone scrolled the pane up, and trim the agent's input composer and
+  status footer so you see real output.
 - **Usage at a glance.** Reads Codex's rate-limit windows from its logs and
   OpenCode's per-session cost/tokens from its database, side by side in the
   header and in a detail panel.
+- **Portable settings.** An optional config file carries your project roots and
+  preferences between machines.
 - **Safe by construction.** No shell command strings, literal argument passing,
   exact-name deletion with revalidation, and filtered terminal output.
 
-## Install
+## Install (Linux)
+
+Requires Python 3.8+ and `tmux`; agent sessions additionally need whichever
+agent binaries you already use. Nothing is downloaded at runtime.
 
 ```bash
 git clone https://github.com/T-Lind/agmux.git
 cd agmux
-./install.sh                       # symlinks agmux (and cx) into ~/.local/bin
+./install.sh
 ```
 
-Then add the completion and the tmux popup:
+`install.sh` is one command that:
+
+1. links `agmux` (and the historical `cx`) into `~/.local/bin`,
+2. adds bash completion to `~/.bashrc`,
+3. adds the `Ctrl-b Ctrl-s` popup to `~/.tmux.conf`,
+4. installs the `agmux(1)` man page, and
+5. tells you if `~/.local/bin` is missing from `PATH`.
+
+It is idempotent and reversible:
 
 ```bash
-# ~/.bashrc
-source "$HOME/source/repos/agmux/completion.bash"
+./install.sh --bin ~/bin      # choose where to link the command
+./install.sh --no-integration # link only; do not touch dotfiles
+./install.sh --uninstall      # remove the links and the managed blocks
 ```
 
-```tmux
-# ~/.tmux.conf
-source-file ~/source/repos/agmux/tmux.conf
-```
-
-Reload with `source ~/.bashrc` and `tmux source-file ~/.tmux.conf`.
-If `~/.local/bin` is not on the tmux server's `PATH`, set `AGMUX_BIN` to the
-absolute path of the `agmux` script.
+Then reload: `source ~/.bashrc` and `tmux source-file ~/.tmux.conf`.
+`make install` / `make uninstall` are thin wrappers over the same script.
+Check everything with `agmux doctor`.
 
 ## Use
 
 Run `agmux` to open the picker. Type to filter by session name, agent, command,
-or directory; select with Up/Down or Tab/Shift-Tab; press Enter to attach (or
-switch your current client when already inside tmux). Esc cancels. A preview
+directory, or state; select with Up/Down or Tab/Shift-Tab; press Enter to attach
+(or switch your current client when already inside tmux). Esc cancels. A preview
 shows the selected session's active pane.
 
 | Key | Action |
@@ -98,7 +115,8 @@ switches *your* terminal, leaving the running processes untouched.
 
 ```bash
 agmux                                   # the picker
-agmux list                              # one line per session (agent, state, dir)
+agmux list                              # one line per session (agent, state, dir, CPU/mem)
+agmux list --json                       # machine-readable sessions
 agmux attach upgrades-4                 # switch/attach to a session
 agmux new ty-fix --cwd ~/source/repos/ty
 agmux new review --agent opencode --cwd ~/source/repos/ty --detach
@@ -128,6 +146,28 @@ actually installed.
 For sessions **started outside agmux**, the agent is inferred from the
 foreground command in the active pane, so an `opencode` or `codex` process is
 labelled even if agmux did not start it.
+
+### CPU and memory per session
+
+Each row shows `CPU%` and resident memory for the whole session: the active
+process in every pane plus its descendants. It is sampled once per refresh from
+`ps` (pid, parent, CPU%, RSS only), so one query covers every session, and is
+off by default on platforms without a compatible `ps`. Set `AGMUX_RESOURCES=0`
+or pass `--no-resources` to hide it. In JSON it is `cpu` (percent) and `rss`
+(kibibytes):
+
+```bash
+agmux list --json | jq '.[] | {name, status, cpu, rss}'
+```
+
+### Previews always show the newest output
+
+The preview and the read-only viewer capture to the *end* of the pane's
+history, so they end on the latest line even when the pane (or the client
+viewing it) has been scrolled up — you always see what the agent is doing now.
+The agent's input composer and status footer are trimmed so real output fills
+the space, and short output hugs the bottom like a real terminal. Toggle the
+preview with `Ctrl-P`; set `AGMUX_TRIM_CHROME=0` to keep the agent chrome.
 
 ### Completion notifications
 
@@ -194,19 +234,69 @@ Both are local file reads; agmux makes **no network requests** and reads no
 credentials. Other agents do not expose comparable local data, so the panel
 says so rather than guessing.
 
+## Projects and configuration
+
+The new-session wizard lists the immediate subdirectories of your **project
+roots** as candidate working directories. By default that is `~/source/repos`;
+set `AGMUX_REPOS` to change it. It accepts several roots separated by `:`, and
+`~` is expanded:
+
+```bash
+export AGMUX_REPOS="$HOME/source/repos:$HOME/work:$HOME/notes"
+```
+
+These are just convenient launch folders — agmux lists and manages sessions from
+your **local tmux server**, and every session stores its own working directory.
+
+### A config file instead of a wall of exports
+
+For settings you want on every shell, put them in an optional
+`~/.config/agmux/config` (override with `AGMUX_CONFIG`, which must be set
+*before* startup). Environment variables always win, so you can keep shared
+defaults in the file and override them per shell:
+
+```ini
+# ~/.config/agmux/config
+repos = ~/source/repos:~/work
+agent = codex
+resources = 1
+
+# extra "needs input" heuristics, '|'-joined regexes
+blocked_patterns = \[y/N\]|continue\?
+```
+
+Recognized keys: `repos`, `agent`, `tmux_socket`, `notify`, `notify_cmd`,
+`watch_interval`, `blocked_patterns`, `working_patterns`, `trim_chrome`,
+`resources`, `ascii`, `bin`, `codex_home`, `opencode_data_dir`.
+
+### Using it across machines
+
+agmux is one file and talks to whichever tmux server it is pointed at, so the
+usual setup is to install it on each machine (`git clone && ./install.sh`) and
+keep `~/.config/agmux/config` in your dotfiles. Sessions do **not** federate
+across machines — a session lives on the tmux server where it was created.
+To work with a remote machine, run agmux there (for example over SSH, or via
+`tmux -L`/`AGMUX_TMUX_SOCKET` against a remote socket). agmux itself still makes
+no network connections; it only ever reads the local tmux server and local
+files.
+
 ### Plain shells
 
 You do not need an agent to use agmux. `agmux new scratch --agent shell`, the
 picker's `Ctrl-N → Shell`, and `Ctrl-W` all create ordinary tmux sessions and
 windows — start a build, tail a log, run `htop`, whatever.
 
-## Configuration
+## Configuration reference
+
+Every setting has an environment variable; all are optional.
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `AGMUX_AGENT` | default agent for `new` | `codex` |
-| `AGMUX_REPOS` | directory listed by the new-session wizard | `~/source/repos` |
+| `AGMUX_REPOS` | project roots listed by the new-session wizard (`:`-separated) | `~/source/repos` |
+| `AGMUX_CONFIG` | config file to load | `~/.config/agmux/config` |
 | `AGMUX_TMUX_SOCKET` | tmux socket to use | current or default |
+| `AGMUX_RESOURCES` | `0` hides per-session CPU/memory | `1` |
 | `AGMUX_NOTIFY` | `0` disables completion notifications | `1` |
 | `AGMUX_NOTIFY_CMD` | custom notification command | unset |
 | `AGMUX_WATCH_INTERVAL` | seconds between blocked-prompt checks | `3` |
@@ -224,9 +314,10 @@ windows — start a build, tail a log, run `htop`, whatever.
 
 agmux is deliberately small so you can read all of it. It uses only the Python
 standard library and local `tmux`/agent binaries; it reads local tmux metadata,
-directory names, and Codex usage logs; it makes no network requests and reads no
-credential files. Session names and pane output are filtered for control
-characters before display. Agent arguments are passed as literal argv
+directory names, one `ps` process listing (pid, parent, CPU%, RSS), the optional
+config file, and Codex/OpenCode usage logs; it makes no network requests and
+reads no credential files. Session names and pane output are filtered for
+control characters before display. Agent arguments are passed as literal argv
 (never a shell string). Deletion targets exactly one resolved session and
 re-validates it immediately before killing. See [SECURITY.md](SECURITY.md) for
 the scope and how it was verified.
@@ -234,30 +325,38 @@ the scope and how it was verified.
 ## Verification
 
 ```bash
+make test                                  # lint + unit tests + UI smoke test
 python3 -m unittest discover -s tests -v   # isolated tmux socket, no real sessions
 python3 tests/ui_smoke.py                  # drives the TUI in private PTYs
-bash -n completion.bash
+bash -n install.sh completion.bash
 ```
 
 Both suites use a private tmux socket and a fake agent binary, so they never
 touch your real sessions. The unit suite covers creation, exact selection,
 rename, preview, literal argument quoting, deletion confirmation and
-revalidation, shell windows, agent detection, ANSI parsing/rendering, screen
-classification, copy-mode cancellation, usage parsing, notifications, and
-`NO_COLOR`/piped output. The smoke test drives the picker, viewer, usage panel,
-new-session wizard, popup switching, and delete flow end to end.
+revalidation, shell windows, agent detection, per-session CPU/memory sampling,
+previews staying on the newest output while scrolled, multi-root project
+listing, ANSI parsing/rendering, screen classification, copy-mode cancellation,
+usage parsing, notifications, config loading, and `NO_COLOR`/piped output. The
+smoke test drives the picker, viewer, usage panel, new-session wizard, popup
+switching, and delete flow end to end.
 
 ## Compatibility
 
 The command was previously named `cx`; `install.sh` keeps a `cx` symlink, and
 the old `CX_*` environment variables still work. `completion.bash` completes
-both names.
+both names. Linux is supported; other Unix systems work when their `ps` supports
+`-eo pid=,ppid=,pcpu=,rss=` (macOS mostly does) and otherwise simply show no
+resource figures.
 
 ## Uninstall
 
-Remove the `source` lines from `~/.bashrc` and `~/.tmux.conf`, delete
-`~/.local/bin/agmux` and `~/.local/bin/cx`, and run `tmux unbind-key C-s` in
-your running tmux server. Your sessions remain available through plain tmux.
+```bash
+./install.sh --uninstall       # or: make uninstall
+```
+
+This removes the `agmux`/`cx` links, the managed blocks in `~/.bashrc` and
+`~/.tmux.conf`, and leaves your sessions and dotfiles otherwise intact.
 
 ## License
 

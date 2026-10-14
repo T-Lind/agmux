@@ -1,9 +1,10 @@
 # Security and scope
 
-Scope: `agmux.py`, `completion.bash`, `tmux.conf`, and their installed source
-lines in `~/.bashrc` and `~/.tmux.conf`. agmux is one standard-library Python
-file plus the `tmux` and agent binaries already on the machine. There is no
-vendor, updater, background service, or network client.
+Scope: `agmux.py`, `install.sh`, `completion.bash`, `tmux.conf`, `agmux.1`,
+`Makefile`, and their installed source lines in `~/.bashrc` and `~/.tmux.conf`.
+agmux is one standard-library Python file plus the `tmux` and agent binaries
+already on the machine. There is no vendor, updater, background service, or
+network client.
 
 ## What agmux accesses
 
@@ -21,6 +22,11 @@ vendor, updater, background service, or network client.
 - The visible text of a session's active pane, read with `capture-pane`, to
   label the agent and to classify whether it is working, idle, or waiting on
   the user, and to trim the agent's input/status chrome from previews.
+- One system process listing (`ps -eo pid=,ppid=,pcpu=,rss=`) to show per-session
+  CPU and memory: only pid, parent pid, CPU percentage, and resident set size
+  are read; process arguments and environments are never requested or shown.
+- An optional `key = value` config file at `$AGMUX_CONFIG` or
+  `~/.config/agmux/config`, used only to set defaults for the variables below.
 - Executable locations on `PATH` for tmux and the agent binaries, and the
   normal shell path.
 - Settings such as `TMUX`, `TMUX_PANE`, `AGMUX_*`, `CX_*`, and `SHELL`.
@@ -97,8 +103,10 @@ terminal defaults and is never passed through raw escape sequences.
   deletion confirmation and cancellation; exact-target deletion leaving other
   sessions intact; refusal when the target changed during confirmation;
   shell-window working-directory and detached behavior; agent detection from a
-  foreground command; usage-log parsing; notification command execution; and
-  plain piped output.
+  foreground command; per-session CPU/memory sampling; previews ending on the
+  newest output while a pane is scrolled in copy mode; multi-root repository
+  listing; usage-log parsing; notification command execution; and plain piped
+  output.
 - Private-terminal checks (`python3 tests/ui_smoke.py`) drive navigation,
   rename, attach/detach, the new-session wizard with a fake agent binary,
   help/usage/preview toggles, no input forwarding from the viewer, switching

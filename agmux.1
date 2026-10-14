@@ -1,0 +1,134 @@
+.TH AGMUX 1 "2026" "agmux 0.5.0" "User Commands"
+.SH NAME
+agmux \- a terminal control panel for tmux and AI coding agents
+.SH SYNOPSIS
+.B agmux
+[\fI\,--no-preview\/\fR] [\fI\,--no-notify\/\fR] [\fI\,--no-resources\/\fR] [\fI\,command\/\fR] [\fI\,args\/\fR]
+.SH DESCRIPTION
+.B agmux
+lists and manages tmux sessions that run AI coding agents such as Codex,
+OpenCode, or Claude Code, and plain shells. It is a single, dependency\-free
+Python file that reads local tmux metadata and makes no network requests.
+.PP
+Run with no command to open the picker. Type to filter, use Up/Down to select,
+and press Enter to attach (or switch your current tmux client).
+.SH COMMANDS
+.TP
+.B list, ls
+One line per session with agent, state, directory, and CPU/memory. Add
+.B --json
+for machine\-readable output.
+.TP
+.B attach SESSION
+Attach outside tmux; switch the current client inside tmux.
+.TP
+.B new NAME
+Start an agent or shell in a named session. Options:
+.BR --agent ,
+.BR --cwd ,
+.BR --shell ,
+.BR --detach ,
+.BR --no-notify .
+Arguments after
+.B --
+are passed to the agent.
+.TP
+.B rename SESSION NAME
+Rename a session.
+.TP
+.B shell SESSION
+Add a detached shell window in the session's directory.
+.TP
+.B delete SESSION
+End a session after typing its exact name. Alias:
+.BR kill .
+.B --yes
+skips the typed confirmation for that one session.
+.TP
+.B usage
+Show locally available provider usage (Codex rate limits, OpenCode session cost).
+.TP
+.B agents
+List known agents and whether their binaries are installed.
+.TP
+.B preview SESSION
+Print recent output from the active pane.
+.TP
+.B peek SESSION
+Read\-only live viewer that never attaches a client or forwards input.
+.TP
+.B watch
+Notify when any agent starts waiting for input. Options:
+.BR --interval ,
+.BR --once .
+.TP
+.B last
+Switch back to the previous session (inside tmux).
+.TP
+.B detach
+Detach the current tmux client.
+.TP
+.B doctor
+Report tools, paths, config, and integration status.
+.SH KEY BINDINGS (picker)
+Type to filter; Up/Down or Tab to select; Enter to attach; Ctrl\-N new session;
+Ctrl\-G usage panel; Ctrl\-R rename; Ctrl\-D delete; Ctrl\-W add shell window;
+Ctrl\-O read\-only viewer; Ctrl\-P toggle preview; Ctrl\-L refresh; Ctrl\-U clear
+search; F1 help; Esc cancel.
+.PP
+Inside tmux, Ctrl\-b then Ctrl\-s opens the picker in a popup.
+.SH CONFIGURATION
+Environment variables override the optional config file
+.B ~/.config/agmux/config
+(override its location with
+.BR AGMUX_CONFIG ).
+The file uses simple
+.I key = value
+lines; recognized keys are
+.BR repos ,
+.BR agent ,
+.BR tmux_socket ,
+.BR notify ,
+.BR notify_cmd ,
+.BR watch_interval ,
+.BR blocked_patterns ,
+.BR working_patterns ,
+.BR trim_chrome ,
+.BR resources ,
+.BR ascii ,
+.BR bin ,
+.BR codex_home ,
+and
+.BR opencode_data_dir .
+.PP
+.B AGMUX_REPOS
+lists the project roots shown by the new\-session wizard; separate several
+directories with
+.BR : .
+Defaults to
+.BR ~/source/repos .
+.SH FILES
+.TP
+.I ~/.config/agmux/config
+optional settings file
+.TP
+.I ~/.local/bin/agmux
+installed command
+.SH ENVIRONMENT
+.BR AGMUX_AGENT ,
+.BR AGMUX_REPOS ,
+.BR AGMUX_TMUX_SOCKET ,
+.BR AGMUX_NOTIFY ,
+.BR AGMUX_NOTIFY_CMD ,
+.BR AGMUX_WATCH_INTERVAL ,
+.BR AGMUX_BLOCKED_PATTERNS ,
+.BR AGMUX_WORKING_PATTERNS ,
+.BR AGMUX_TRIM_CHROME ,
+.BR AGMUX_RESOURCES ,
+.BR AGMUX_ASCII ,
+.BR AGMUX_BIN ,
+.BR AGMUX_CONFIG ,
+.BR CODEX_HOME ,
+.BR OPENCODE_DATA_DIR .
+.SH SEE ALSO
+.BR tmux (1)

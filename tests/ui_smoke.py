@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
     launcher.chmod(0o755)
     env = dict(os.environ, AGMUX_TMUX_SOCKET=socket, AGMUX_REPOS=str(repositories),
                CODEX_HOME=str(codexhome), OPENCODE_DATA_DIR=str(root / 'ocdata'),
-               AGMUX_NOTIFY='0', AGMUX_ASCII='1',
+               AGMUX_NOTIFY='0', AGMUX_ASCII='1', AGMUX_CONFIG=os.devnull,
                TERM='xterm-256color', PATH=str(fakebin) + os.pathsep + os.environ['PATH'])
     env.pop('TMUX', None)
     env.pop('TMUX_PANE', None)
