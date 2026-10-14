@@ -14,9 +14,13 @@ vendor, updater, background service, or network client.
 - The newest Codex session log under `$CODEX_HOME/sessions` (default
   `~/.codex/sessions`), and only its trailing bytes, to read the `rate_limits`
   record for the usage panel. No other part of the log is displayed or stored.
+- OpenCode's SQLite database under `$OPENCODE_DATA_DIR` (default
+  `~/.local/share/opencode`), opened read-only, and only the session title,
+  cost, token counts, and model of the most recent sessions. No credential,
+  message, or account tables are read.
 - The visible text of a session's active pane, read with `capture-pane`, to
   label the agent and to classify whether it is working, idle, or waiting on
-  the user.
+  the user, and to trim the agent's input/status chrome from previews.
 - Executable locations on `PATH` for tmux and the agent binaries, and the
   normal shell path.
 - Settings such as `TMUX`, `TMUX_PANE`, `AGMUX_*`, `CX_*`, and `SHELL`.

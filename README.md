@@ -6,8 +6,8 @@ Claude Code / … , get told when an agent finishes, and see your usage limits �
 without leaving the terminal.
 
 ```
-agmux 0.3.0           4 sessions · 1 running · 1 need input · 1 done
-Codex · 5h 12% · 7d 34%                               Ctrl-G details
+agmux 0.4.0           4 sessions · 1 running · 1 need input · 1 done
+Codex · 5h 12% · 7d 34%    OpenCode 392K tok · $0.27  Ctrl-G details
 Search:
 ! ty-review   Codex    2w  needs input   codex  ~/source/repos/ty     2m
 ▶ upgrades-4  Codex    2w  attached      codex  ~/source/repos/ty     4m
@@ -38,8 +38,9 @@ layer that answers those questions and stays out of the way.
 - **Live previews in color.** The preview and the read-only viewer render the
   pane's own colors and styles (parsed and re-emitted safely, never raw), and
   trim the agent's input composer and status footer so you see real output.
-- **Usage at a glance.** Reads the rate-limit windows Codex already writes to
-  disk and shows them in the header and in a detail panel.
+- **Usage at a glance.** Reads Codex's rate-limit windows from its logs and
+  OpenCode's per-session cost/tokens from its database, side by side in the
+  header and in a detail panel.
 - **Safe by construction.** No shell command strings, literal argument passing,
   exact-name deletion with revalidation, and filtered terminal output.
 
@@ -179,14 +180,19 @@ cancel`), so you always land on the live view rather than a stale scrollback.
 
 ### Usage limits
 
-Codex records token counts and rate-limit windows in its local session logs.
-agmux reads the newest one under `$CODEX_HOME/sessions` (default `~/.codex`) and
-shows the 5-hour and 7-day windows, percent used, and reset time — in the header
-and in the full panel (`Ctrl-G`). This is a local file read; agmux makes **no
-network requests** and reads no credentials.
+**Codex.** Codex records token counts and rate-limit windows in its local
+session logs. agmux reads the newest one under `$CODEX_HOME/sessions` (default
+`~/.codex`) and shows the 5-hour and 7-day windows, percent used, and reset
+time — in the header and in the full panel (`Ctrl-G`).
 
-Other agents do not expose comparable local limit data, so the panel says so
-rather than guessing.
+**OpenCode.** OpenCode does not expose account rate limits locally, but it
+stores per-session cost and token counts in its SQLite database. agmux reads
+that (read-only) and shows recent sessions' cost and tokens next to the Codex
+windows. Set `OPENCODE_DATA_DIR` if your database lives elsewhere.
+
+Both are local file reads; agmux makes **no network requests** and reads no
+credentials. Other agents do not expose comparable local data, so the panel
+says so rather than guessing.
 
 ### Plain shells
 
@@ -210,6 +216,7 @@ windows — start a build, tail a log, run `htop`, whatever.
 | `AGMUX_ASCII` | `1` forces ASCII glyphs | unset |
 | `AGMUX_BIN` | path to `agmux` used by the tmux popup | `agmux` |
 | `CODEX_HOME` | where Codex stores session logs | `~/.codex` |
+| `OPENCODE_DATA_DIR` | where OpenCode stores its database | `~/.local/share/opencode` |
 
 `CX_REPOS` and `CX_TMUX_SOCKET` are still honored for backwards compatibility.
 

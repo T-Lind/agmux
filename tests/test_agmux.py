@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -441,6 +442,17 @@ class AnsiAndState(unittest.TestCase):
         self.assertEqual(state, "blocked")
         self.assertTrue(prompt)
 
+    def test_classify_screen_prefers_live_work(self):
+        # Real Codex line: reviewing an approval is work, not a user prompt.
+        state, _ = agmux.classify_screen(
+            ["\u2022 Reviewing approval request (10s \u2022 esc to interrupt)"])
+        self.assertEqual(state, "working")
+        # A genuine approval prompt with no live-work marker is blocked.
+        state, prompt = agmux.classify_screen(
+            ["Allow Codex to run this command?", "  1. Yes", "  2. No"])
+        self.assertEqual(state, "blocked")
+        self.assertTrue(prompt)
+
     def test_row_status_prefers_screen_state(self):
         self.assertEqual(agmux.row_status({"agent": "codex", "state": "blocked"}), "blocked")
         self.assertEqual(agmux.row_status({"agent": "codex", "state": "working"}), "running")
@@ -488,6 +500,22 @@ class AnsiAndState(unittest.TestCase):
         self.assertEqual(agmux.trim_chrome("shell", lines), ["$ ls -la", "total 0", "$ echo hi"])
         self.assertEqual(agmux.trim_chrome(None, ["plain", "text"]), ["plain", "text"])
 
+    def test_trim_chrome_handles_ansi_lines(self):
+        # Regression: captured pane lines carry SGR escapes; the trimmer must
+        # look at the plain text, not the raw bytes.
+        esc, reset = "\x1b[38;2;1;2;3m", "\x1b[0m"
+        codex = [esc + "real output" + reset,
+                 esc + "  \u203a Ask Codex to do anything" + reset,
+                 esc + "  GPT-6.1-Sol xhigh \u00b7 ~/x \u00b7 t" + reset,
+                 esc + "  \u2190 for agents \u00b7 ? for shortcuts" + reset]
+        self.assertEqual(len(agmux.trim_chrome("codex", codex)), 1)
+        opencode = [esc + "tool output" + reset,
+                    esc + "  \u2503" + reset,
+                    esc + "  \u2503  Build \u00b7 X \u00b7 high" + reset,
+                    esc + "  \u2579\u2580\u2580" + reset,
+                    esc + "  \u2b1d\u25a0\u25a0\u2b1d esc interrupt  1K (9%) \u00b7 $0 ctrl+p commands" + reset]
+        self.assertEqual(len(agmux.trim_chrome("opencode", opencode)), 1)
+
     def test_trim_chrome_can_be_disabled(self):
         lines = ["content", "  \u203a Ask Codex to do anything", ""]
         with patch.dict(os.environ, {"AGMUX_TRIM_CHROME": "0"}):
@@ -519,7 +547,8 @@ class Usage(unittest.TestCase):
                 }},
             }
             rollout.write_text(json.dumps({"ignored": True}) + "\n" + json.dumps(record) + "\n")
-            with patch.object(agmux, "CODEX_HOME", home):
+            with patch.object(agmux, "CODEX_HOME", home), \
+                    patch.object(agmux, "opencode_usage", return_value=None):
                 limits = agmux.find_codex_rate_limits()
                 self.assertEqual(limits["plan_type"], "plus")
                 self.assertIn("Codex", agmux.usage_inline(limits))
@@ -528,11 +557,41 @@ class Usage(unittest.TestCase):
                 self.assertIn("5h", report)
                 self.assertIn("credits: 3", report)
 
+    def test_opencode_usage_from_database(self):
+        with tempfile.TemporaryDirectory(prefix="agmux-oc-") as directory:
+            db = Path(directory) / "opencode.db"
+            connection = sqlite3.connect(db)
+            connection.execute("create table session_v2 (id text, title text, cost real, "
+                               "tokens_input integer, tokens_output integer, model text, "
+                               "time_updated integer)")
+            connection.execute(
+                "insert into session_v2 values ('s1','Build a thing',0.243,282628,77822,"
+                "'{\"id\":\"deepseek-v4.1-flash\",\"providerID\":\"opencode-go\"}',200)")
+            connection.execute(
+                "insert into session_v2 values ('s2','Older',0.001,100,5,null,100)")
+            connection.commit()
+            connection.close()
+            with patch.object(agmux, "OPENCODE_DB", db):
+                agmux._OPENCODE_CACHE["at"] = 0.0
+                usage = agmux.opencode_usage()
+            agmux._OPENCODE_CACHE["at"] = 0.0
+            self.assertEqual(usage["latest"]["title"], "Build a thing")
+            self.assertEqual(usage["latest"]["tokens"], 282628 + 77822)
+            self.assertEqual(usage["latest"]["model"], "opencode-go/deepseek-v4.1-flash")
+            self.assertIn("OpenCode", agmux.opencode_inline(usage))
+            self.assertIn("$0.24", agmux.opencode_inline(usage))
+            report = "\n".join(text for text, _ in
+                               agmux.usage_report(limits=None, opencode=usage))
+            self.assertIn("Build a thing", report)
+            self.assertIn("OpenCode", report)
+
     def test_missing_usage_is_graceful(self):
         with tempfile.TemporaryDirectory(prefix="agmux-usage-") as directory:
-            with patch.object(agmux, "CODEX_HOME", Path(directory)):
+            with patch.object(agmux, "CODEX_HOME", Path(directory)), \
+                    patch.object(agmux, "opencode_usage", return_value=None):
                 self.assertIsNone(agmux.find_codex_rate_limits())
                 self.assertEqual(agmux.usage_inline(None), "")
+                self.assertEqual(agmux.opencode_inline(None), "")
                 self.assertTrue(agmux.usage_report(limits=None))
 
 

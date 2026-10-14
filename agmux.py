@@ -21,9 +21,14 @@ import sys
 import threading
 import time
 
+try:
+    import sqlite3
+except ImportError:  # pragma: no cover - sqlite3 is in the standard library
+    sqlite3 = None
+
 
 APP = "agmux"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 SELF = Path(__file__).resolve()
 
 
@@ -37,6 +42,9 @@ def _env(*names, default=None):
 
 ROOT = Path(_env("AGMUX_REPOS", "CX_REPOS", default=str(Path.home() / "source/repos")))
 CODEX_HOME = Path(_env("CODEX_HOME", default=str(Path.home() / ".codex")))
+OPENCODE_HOME = Path(_env("OPENCODE_DATA_DIR", default=str(
+    Path(_env("XDG_DATA_HOME", default=str(Path.home() / ".local/share"))) / "opencode")))
+OPENCODE_DB = OPENCODE_HOME / "opencode.db"
 DEFAULT_AGENT = _env("AGMUX_AGENT", default="codex")
 
 
@@ -439,14 +447,21 @@ def classify_screen(lines, limit=24):
     tail = [line.rstrip() for line in lines[-limit:] if line.strip()]
     blocked = _compile_patterns(_BLOCKED_PATTERNS, "AGMUX_BLOCKED_PATTERNS")
     working = _compile_patterns(_WORKING_PATTERNS, "AGMUX_WORKING_PATTERNS")
+
+    def is_working(line):
+        return any(pattern.search(line) for pattern in working)
+
     for line in reversed(tail):
+        # A line like "Reviewing approval request (10s - esc to interrupt)" is
+        # live work, not a prompt for the user, so live work wins.
+        if is_working(line):
+            continue
         for pattern in blocked:
             if pattern.search(line):
                 return "blocked", line.strip()[:200]
     joined = "\n".join(tail)
-    for pattern in working:
-        if pattern.search(joined):
-            return "working", ""
+    if any(pattern.search(joined) for pattern in working):
+        return "working", ""
     return "idle", ""
 
 
@@ -461,8 +476,9 @@ _CODEX_STATUS = re.compile(r"\b(?:xhigh|high|medium|low|minimal)\b\s*\u00b7")
 
 def _classify_chrome(agent, line):
     """Return 'strong', 'weak', or None for one trailing preview line."""
-    text = line.rstrip()
-    stripped = text.strip()
+    if "\x1b" in line:
+        line = "".join(text for text, _ in parse_sgr(line))
+    stripped = line.strip()
     if not stripped:
         return "weak"
     if agent == "codex":
@@ -603,6 +619,76 @@ def codex_usage(max_age=30.0):
     return _USAGE_CACHE["data"]
 
 
+_OPENCODE_CACHE = {"at": 0.0, "data": None}
+
+
+def humanize_tokens(count):
+    count = int(count or 0)
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.0f}K"
+    return str(count)
+
+
+def money(value):
+    value = float(value or 0)
+    return f"${value:.2f}" if value >= 0.01 else f"${value:.4f}"
+
+
+def model_label(model):
+    """A short provider/model label from OpenCode's stored model JSON."""
+    if not model:
+        return ""
+    try:
+        data = json.loads(model) if isinstance(model, str) else model
+        name = data.get("id", "")
+        provider = data.get("providerID", "")
+        return f"{provider}/{name}" if provider else name
+    except (ValueError, AttributeError):
+        return str(model)[:40]
+
+
+def opencode_usage(max_age=30.0):
+    """Local OpenCode usage (cost and tokens) from its SQLite database.
+
+    OpenCode stores per-session cost and token counts locally. It does not
+    expose account rate limits, so this reports the sessions agmux can see.
+    """
+    now = time.monotonic()
+    if now - _OPENCODE_CACHE["at"] <= max_age:
+        return _OPENCODE_CACHE["data"]
+    data = None
+    if sqlite3 is not None and OPENCODE_DB.is_file():
+        try:
+            connection = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True, timeout=1)
+            try:
+                rows = connection.execute(
+                    "select title, cost, tokens_input, tokens_output, model, time_updated "
+                    "from session_v2 order by time_updated desc limit 5").fetchall()
+            finally:
+                connection.close()
+            sessions = [dict(title=title or "", cost=float(cost or 0),
+                             tokens=int(tin or 0) + int(tout or 0),
+                             model=model_label(model), updated=int(updated or 0))
+                        for title, cost, tin, tout, model, updated in rows]
+            if sessions:
+                data = dict(latest=sessions[0], sessions=sessions)
+        except (sqlite3.Error, OSError, ValueError):
+            data = None
+    _OPENCODE_CACHE["at"] = now
+    _OPENCODE_CACHE["data"] = data
+    return data
+
+
+def opencode_inline(usage=None):
+    usage = opencode_usage() if usage is None else usage
+    if not usage:
+        return ""
+    latest = usage["latest"]
+    return f"OpenCode {humanize_tokens(latest['tokens'])} tok \u00b7 {money(latest['cost'])}"
+
+
 def usage_inline(limits=None):
     limits = codex_usage() if limits is None else limits
     if not limits:
@@ -617,27 +703,42 @@ def usage_inline(limits=None):
     return " \u00b7 ".join(parts) if len(parts) > 1 else ""
 
 
-def usage_report(width=20, limits=None):
-    """(text, role) lines describing locally available usage limits."""
+def usage_report(width=20, limits=None, opencode=None):
+    """(text, role) lines describing locally available usage."""
     limits = codex_usage() if limits is None else limits
-    if not limits:
-        return [("No local usage data yet - start a Codex session to populate it.", "muted")]
-    lines = [(f"Codex - {limits.get('plan_type') or 'unknown'} plan", "heading")]
-    for key in ("primary", "secondary"):
-        window = limits.get(key) or {}
-        percent = window.get("used_percent")
-        if percent is None:
-            continue
-        label = window_label(window.get("window_minutes"))
-        reset = window.get("resets_at")
-        tail = f"  resets in {humanize_delta(reset - time.time())}" if reset else ""
-        lines.append((f"  {label:>4}  {bar_text(percent, width)} {percent:4.0f}%{tail}",
-                      "warning" if percent >= 80 else "default"))
-    credits = limits.get("credits") or {}
-    if credits.get("has_credits") and credits.get("balance") is not None:
-        lines.append((f"  credits: {credits.get('balance')}", "muted"))
-    if limits.get("rate_limit_reached_type"):
-        lines.append((f"  limit reached: {limits['rate_limit_reached_type']}", "warning"))
+    opencode = opencode_usage() if opencode is None else opencode
+    lines = []
+    if limits:
+        lines.append((f"Codex - {limits.get('plan_type') or 'unknown'} plan", "heading"))
+        for key in ("primary", "secondary"):
+            window = limits.get(key) or {}
+            percent = window.get("used_percent")
+            if percent is None:
+                continue
+            label = window_label(window.get("window_minutes"))
+            reset = window.get("resets_at")
+            tail = f"  resets in {humanize_delta(reset - time.time())}" if reset else ""
+            lines.append((f"  {label:>4}  {bar_text(percent, width)} {percent:4.0f}%{tail}",
+                          "warning" if percent >= 80 else "default"))
+        credits = limits.get("credits") or {}
+        if credits.get("has_credits") and credits.get("balance") is not None:
+            lines.append((f"  credits: {credits.get('balance')}", "muted"))
+        if limits.get("rate_limit_reached_type"):
+            lines.append((f"  limit reached: {limits['rate_limit_reached_type']}", "warning"))
+    else:
+        lines.append(("No local usage data yet - start a Codex session to populate it.", "muted"))
+
+    lines.append(("", "default"))
+    lines.append(("OpenCode - local session usage", "heading"))
+    if opencode:
+        for session in opencode["sessions"][:4]:
+            title = clean(session["title"] or "(untitled)")[:40]
+            lines.append((f"  {title:<42} {humanize_tokens(session['tokens']):>6} tok  "
+                          f"{money(session['cost'])}", "default"))
+        lines.append(("  (OpenCode has no local account rate limits; showing session cost.)",
+                      "muted"))
+    else:
+        lines.append(("  No local OpenCode usage found.", "muted"))
     return lines
 
 
@@ -1622,7 +1723,7 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True):
         summary += f" \u00b7 {finished} done"
         put(screen, 0, 0, f"{APP} {VERSION}", style.heading)
         put_right(screen, 0, summary, style.warning if blocked else style.muted)
-        usage = usage_inline()
+        usage = "    ".join(part for part in (usage_inline(), opencode_inline()) if part)
         if usage:
             put(screen, 1, 0, usage, style.muted)
             put_right(screen, 1, "Ctrl-G details", style.help)
@@ -1639,7 +1740,11 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True):
             put(screen, list_top, 0,
                 "No matching sessions. Ctrl-N starts one.", style.muted)
         if show_preview:
-            preview_y = list_top + list_height + 1
+            # Give the preview every row the list does not need, so it grows
+            # upward when there are few sessions and never shrinks below the
+            # current half-and-half minimum.
+            used = max(1, min(len(matches), list_height))
+            preview_y = list_top + used + 1
             put(screen, preview_y - 1, 0, GLYPH["sep"] * (width - 1), style.muted)
             if selected:
                 if selected_id != preview_key or now - preview_at > 2:
