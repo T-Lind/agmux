@@ -4,6 +4,15 @@ All notable changes to agmux are documented here. The format is loosely based
 on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [semantic versioning](https://semver.org/).
 
+## [0.6.2]
+
+### Changed
+- `Alt-s` now detaches the current tmux client and runs the agmux picker
+  directly in the same terminal, instead of opening it as a popup. It propagates
+  the tmux socket and clears `TMUX`/`TMUX_PANE`, so agmux behaves as a normal
+  outside-tmux client; selecting a session reattaches, and `Esc` returns to the
+  shell. `Ctrl-b Ctrl-s` still opens the in-place popup.
+
 ## [0.6.1]
 
 ### Added
@@ -97,6 +106,7 @@ on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 ## [0.2.0]
 - Agent-aware tmux session manager.
 
+[0.6.2]: https://github.com/T-Lind/agmux/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/T-Lind/agmux/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/T-Lind/agmux/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/T-Lind/agmux/compare/v0.5.0...v0.5.1

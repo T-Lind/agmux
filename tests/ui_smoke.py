@@ -151,6 +151,21 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         assert other_proc.returncode == 0
         print('PASS: two-client isolation, popup switching, and last-session navigation')
 
+        master, proc = launch(command + ['attach-session', '-t', '=alpha'])
+        wait_clients('alpha')
+        os.write(master, b'\x1bs')  # Alt-s: detach and run agmux directly
+        wait_output(master, b'agmux 0.')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if tmux('list-clients', '-F', '#{session_name}') == '':
+                break
+            time.sleep(0.05)
+        assert tmux('list-clients', '-F', '#{session_name}') == '', 'Alt-s did not detach'
+        os.write(master, b'\x1b')  # leave the picker; the terminal should finish
+        proc.wait(timeout=5)
+        assert proc.returncode == 0
+        print('PASS: Alt-s detaches and replaces the client with agmux')
+
         master, proc = launch([sys.executable, str(MODULE), '--no-preview'])
         wait_output(master, b'agmux 0.')
         os.write(master, b'\x1bOP')  # F1 in xterm application mode
@@ -223,7 +238,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         wait_output(master, b'choose what to run')
         os.write(master, b'\r')
         wait_output(master, b'choose a directory')
-        os.write(master, b'Other')
+        os.write(master, b'Other directory')
         time.sleep(0.3)
         os.write(master, b'\r')
         wait_output(master, b'Directory (~ is expanded')

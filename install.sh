@@ -7,8 +7,8 @@
 #   ./install.sh --no-integration    # only link the command
 #   ./install.sh --uninstall         # remove links and the managed blocks
 #
-# The tmux block installs Ctrl-b Ctrl-s (prefix), Alt-s (open agmux), and
-# Alt-x (kill the current session after confirmation). Everything is
+# The tmux block installs Ctrl-b Ctrl-s (popup), Alt-s (detach and open agmux),
+# and Alt-x (kill the current session after confirmation). Everything is
 # idempotent: the integration lives between markers and is replaced in place,
 # so running it twice is safe.
 set -euo pipefail

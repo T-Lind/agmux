@@ -68,8 +68,9 @@ contain anything already printed by the program in that pane; use `Ctrl-P` or
 - The shipped `tmux.conf` also binds `Alt-x` to tmux's raw `kill-session` after
   a `y/n` confirmation. That convenience binding bypasses agmux's typed-name
   confirmation and snapshot revalidation by design; remove or rebind it if you
-  want every deletion to go through agmux. `Alt-s` opens the ordinary, read-only
-  picker.
+  want every deletion to go through agmux. `Alt-s` detaches the current client,
+  sets `AGMUX_TMUX_SOCKET` from tmux's socket path, clears `TMUX`/`TMUX_PANE`,
+  and replaces the client with the ordinary agmux picker in the same terminal.
 - Adding a shell window uses `new-window -d`, so no attached client is moved and
   no input is injected into any existing pane.
 - The read-only viewer captures output without attaching a tmux client or

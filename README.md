@@ -9,7 +9,7 @@ terminal.
 ![The agmux picker: sessions with agent state, a live preview, and per-session CPU and memory](docs/screenshot.svg)
 
 ```
-agmux 0.6.1                     5 sessions · 2 running · 1 need input · 1 done
+agmux 0.6.2                     5 sessions · 2 running · 1 need input · 1 done
 Codex · 5h 12% · 7d 34%       OpenCode 392K tok · $0.27        Ctrl-G details
 Search:
 ! ty-review    Codex    2w  needs input  cpu 12% · mem 486M  codex  ~/source/repos/ty     2m
@@ -128,8 +128,13 @@ not need the `Ctrl-b` prefix while attached:
 
 | Binding | Action |
 | --- | --- |
-| `Alt-s` | open the agmux picker over the current session |
+| `Alt-s` | detach this client and open the agmux picker in the same terminal |
 | `Alt-x` | kill the current session after a `y/n` confirmation |
+
+`Alt-s` leaves the tmux client, so agmux runs directly and selecting a session
+attaches you to it; `Esc` in the picker returns you to the shell. The picker is
+not overlaid on the old session in this mode. Use `Ctrl-b Ctrl-s` if you prefer
+the popup that stays inside tmux.
 
 `Alt-x` stops every program in that session and detaches its clients. Use the
 picker's `Ctrl-D` flow instead if you want agmux's typed-name confirmation and
