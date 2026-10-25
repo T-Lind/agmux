@@ -4,6 +4,18 @@ All notable changes to agmux are documented here. The format is loosely based
 on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [semantic versioning](https://semver.org/).
 
+## [0.6.4]
+
+### Changed
+- Rewrote the in-app help (F1) as grouped sections with an aligned key column,
+  so bindings are easier to scan: search and move, sessions, view, inside tmux,
+  command line, and what the status markers and resource figures mean.
+- Help now covers everything added since the old text: `Alt-s`, `Alt-x`, the
+  popup `Ctrl-b Ctrl-s`, the read-only viewer, preview toggle, usage panel,
+  and the `list --json`, `info --json`, `usage --json`, and `doctor` commands.
+- Help descriptions wrap to the terminal width and fall back to a stacked
+  layout on narrow screens; the footer shows the current scroll position.
+
 ## [0.6.3]
 
 ### Fixed
@@ -116,6 +128,7 @@ on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 ## [0.2.0]
 - Agent-aware tmux session manager.
 
+[0.6.4]: https://github.com/T-Lind/agmux/compare/v0.6.3...v0.6.4
 [0.6.3]: https://github.com/T-Lind/agmux/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/T-Lind/agmux/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/T-Lind/agmux/compare/v0.6.0...v0.6.1

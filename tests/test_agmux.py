@@ -1037,5 +1037,31 @@ class Config(unittest.TestCase):
                 agmux.repos()
 
 
+class Help(unittest.TestCase):
+    def test_help_covers_current_bindings_and_commands(self):
+        text = "\n".join("".join(part for _, part in line)
+                         for line in agmux.build_help_lines(100))
+        for expected in ("Alt-s", "Alt-x", "Ctrl-b Ctrl-s", "Ctrl-O", "Ctrl-P",
+                         "Ctrl-G", "Ctrl-N", "Ctrl-R", "Ctrl-D", "Ctrl-W",
+                         "agmux doctor", "agmux list --json",
+                         "agmux info NAME --json", "agmux usage --json",
+                         "no telemetry"):
+            self.assertIn(expected, text)
+
+    def test_help_wraps_to_the_terminal_width(self):
+        for width in (40, 60, 80, 100, 140):
+            for line in agmux.build_help_lines(width):
+                rendered = "".join(part for _, part in line)
+                self.assertLessEqual(len(rendered), width, (width, rendered))
+
+    def test_help_uses_a_single_aligned_description_column(self):
+        lines = agmux.build_help_lines(100)
+        starts = set()
+        for segments in lines:
+            if len(segments) == 2 and segments[0][0] == "key":
+                starts.add(len(segments[0][1]))
+        self.assertEqual(len(starts), 1, starts)
+
+
 if __name__ == "__main__":
     unittest.main()

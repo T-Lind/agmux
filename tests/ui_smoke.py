@@ -195,9 +195,9 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         os.write(master, b'\x1bOP')  # F1
         wait_output(master, b'keyboard help')
         time.sleep(0.2)
-        os.write(master, b'\x1b[6~')  # PageDown
-        time.sleep(0.2)
-        os.write(master, b'\x1b[6~')
+        for _ in range(6):
+            os.write(master, b'\x1b[6~')  # PageDown to the end of the help
+            time.sleep(0.1)
         wait_output(master, b'no telemetry')
         os.write(master, b'\r')
         wait_output(master, b'Enter attach')

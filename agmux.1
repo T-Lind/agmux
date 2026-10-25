@@ -1,4 +1,4 @@
-.TH AGMUX 1 "2026" "agmux 0.6.3" "User Commands"
+.TH AGMUX 1 "2026" "agmux 0.6.4" "User Commands"
 .SH NAME
 agmux \- a terminal control panel for tmux and AI coding agents
 .SH SYNOPSIS
@@ -91,10 +91,64 @@ Detach the current tmux client.
 .B doctor
 Report tools, paths, config, and integration status.
 .SH KEY BINDINGS (picker)
-Type to filter; Up/Down or Tab to select; Enter to attach; Ctrl\-N new session;
-Ctrl\-G usage panel; Ctrl\-R rename; Ctrl\-D delete; Ctrl\-W add shell window;
-Ctrl\-O read\-only viewer; Ctrl\-P toggle preview; Ctrl\-L refresh; Ctrl\-U clear
-search; F1 help; Esc cancel.
+.SS Search and move
+.TP
+.B type
+Filter by session name, agent, command, or directory.
+.TP
+.B Up/Down, Tab, Shift\-Tab
+Move the selection.
+.TP
+.B PgUp/PgDn, Home/End
+Jump through the list.
+.TP
+.B Ctrl\-U
+Clear the search.
+.TP
+.B Ctrl\-L
+Refresh sessions and preview now.
+.SS Sessions
+.TP
+.B Enter
+Attach, or switch this terminal to the selected session.
+.TP
+.B Ctrl\-N
+Start an agent or shell session (short wizard).
+.TP
+.B Ctrl\-R
+Rename the selected session.
+.TP
+.B Ctrl\-D, Delete
+Delete the selected session; type its name to confirm.
+.TP
+.B Ctrl\-W
+Add a shell window in the session's directory.
+.SS View
+.TP
+.B Ctrl\-P
+Show or hide the pane preview.
+.TP
+.B Ctrl\-O
+Read\-only output viewer; keys never reach the pane.
+.TP
+.B Ctrl\-G
+Usage limits and session cost, read locally.
+.TP
+.B F1
+Show help.
+.TP
+.B Esc
+Leave the picker or panel.
+.SS Inside tmux
+.TP
+.B Ctrl\-b Ctrl\-s
+Open the picker as a popup, staying inside tmux.
+.TP
+.B Alt\-s
+Detach and open the picker in this terminal.
+.TP
+.B Alt\-x
+Kill the current session after a y/n confirmation.
 .PP
 Inside tmux, Ctrl\-b then Ctrl\-s opens the picker in a popup. The shipped
 .B tmux.conf

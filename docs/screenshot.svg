@@ -29,7 +29,7 @@
   <text x="640" y="44" text-anchor="middle" class="mono title" opacity="0.75">agmux — ~/source/repos/agmux</text>
 
   <!-- header -->
-  <text x="36" y="86" class="mono head" font-weight="bold">agmux 0.6.3</text>
+  <text x="36" y="86" class="mono head" font-weight="bold">agmux 0.6.4</text>
   <text x="1244" y="86" text-anchor="end" class="mono muted">5 sessions · 2 running · 1 need input · 1 done</text>
 
   <!-- usage line (rate limits / token cost — not machine resources) -->

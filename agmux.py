@@ -18,6 +18,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 
@@ -28,7 +29,7 @@ except ImportError:  # pragma: no cover - sqlite3 is in the standard library
 
 
 APP = "agmux"
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 SELF = Path(__file__).resolve()
 
 
@@ -1789,44 +1790,111 @@ def viewer(screen, tmux, row, style=None):
             refreshed = 0
 
 
+HELP_SECTIONS = (
+    ("Search and move", (
+        ("Type", "filter by session name, agent, command, or directory"),
+        ("Up/Down, Tab", "move the selection"),
+        ("PgUp/PgDn, Home/End", "jump through the list"),
+        ("Ctrl-U", "clear the search"),
+        ("Ctrl-L", "refresh sessions and preview now"),
+    )),
+    ("Sessions", (
+        ("Enter", "attach, or switch to the selected session"),
+        ("Ctrl-N", "start an agent or shell session (short wizard)"),
+        ("Ctrl-R", "rename the selected session"),
+        ("Ctrl-D, Delete", "delete the selected session (type its name to confirm)"),
+        ("Ctrl-W", "add a shell window in the session's directory"),
+    )),
+    ("View", (
+        ("Ctrl-P", "show or hide the pane preview"),
+        ("Ctrl-O", "read-only output viewer; keys never reach the pane"),
+        ("Ctrl-G", "usage limits and session cost, read locally"),
+        ("F1", "this help"),
+        ("Esc", "leave the picker or panel"),
+    )),
+    ("Inside tmux", (
+        ("Ctrl-b Ctrl-s", "open the picker as a popup, staying inside tmux"),
+        ("Alt-s", "detach and open the picker in this terminal"),
+        ("Alt-x", "kill the current session after a y/n confirmation"),
+        ("", "Alt-s is not a popup: choosing a session reattaches you, and Esc"),
+        ("", "returns to the shell. Alt-x stops every program in the session."),
+    )),
+    ("Command line", (
+        ("agmux --help", "every command and option"),
+        ("agmux list --json", "one JSON array of sessions"),
+        ("agmux info NAME --json", "one session's details as JSON"),
+        ("agmux usage --json", "local limits and cost as JSON"),
+        ("agmux doctor", "tools, usage sources, and tmux integration"),
+    )),
+    ("What you are seeing", (
+        ("", "Sessions whose agent needs input are flagged and sorted first."),
+        ("", "Finished sessions get a check mark and a notification."),
+        ("", "cpu X% and mem Y are this machine's CPU and RAM for the session's"),
+        ("", "processes, not token, context-window, or rate-limit usage."),
+        ("", "Deleting ends the session and its programs; files on disk are"),
+        ("", "untouched. Previews and the viewer keep the pane's own colors."),
+        ("", "Everything is read locally: no telemetry and no network requests."),
+    )),
+)
+
+
+def build_help_lines(width):
+    """Lay out help as styled segments, wrapping cleanly at any width."""
+    key_width = max(len(key) for _, entries in HELP_SECTIONS
+                    for key, _ in entries if key)
+    column = min(24, key_width + 2)
+    stacked = width < column + 34
+    lines = []
+    for title, entries in HELP_SECTIONS:
+        if lines:
+            lines.append([("blank", "")])
+        lines.append([("section", title)])
+        for key, description in entries:
+            if not key:
+                for chunk in textwrap.wrap(description, max(16, width - 4)) or [""]:
+                    lines.append([("note", "  " + chunk)])
+                continue
+            if stacked:
+                lines.append([("key", "  " + key)])
+                for chunk in textwrap.wrap(description, max(12, width - 6)) or [""]:
+                    lines.append([("note", "      " + chunk)])
+                continue
+            lead = "  " + key.ljust(column)
+            chunks = textwrap.wrap(description, max(12, width - column - 2)) or [""]
+            lines.append([("key", lead), ("desc", chunks[0])])
+            for chunk in chunks[1:]:
+                lines.append([("note", "  " + " " * column + chunk)])
+    return lines
+
+
 def show_help(screen, style=None):
     style = style or Style()
-    lines = [f"{APP} - keyboard help", "",
-             "Type: search session names, agents, commands, and directories",
-             "Up/Down or Tab/Shift-Tab: select a session",
-             "PageUp/PageDown, Home/End: move through the list",
-             "Enter: attach or switch your terminal to the selected session",
-             "Ctrl-N: start a new agent or shell session (a short wizard)",
-             "Ctrl-G: show locally available usage limits",
-             "Ctrl-R: rename the selected session",
-             "Ctrl-D or Delete: delete the selected session (asks you to confirm)",
-             "Ctrl-W: add a detached shell window in the session's directory",
-             "Ctrl-O: read-only output viewer (your keys stay in the viewer)",
-             "Ctrl-P: show/hide pane preview",
-             "Ctrl-L: refresh immediately; Ctrl-U: clear the search",
-             "Esc: cancel; F1: help", "",
-             "Sessions whose agent needs input are flagged and sorted first.",
-             "Sessions whose agent finishes get a check mark and a notification.",
-             "Previews and the viewer show the pane's own colors and styles, with the",
-             "newest output at the bottom even if the pane has been scrolled up.",
-             "cpu X% and mem Y are this machine's CPU and RAM used by the session's",
-             "processes - not token, context-window, or rate-limit usage.",
-             "Deleting ends a live session and its programs; project files stay on disk.",
-             "This helper reads local tmux output, directory names, and Codex usage",
-             "logs. It has no telemetry and makes no network requests.", "",
-             "Esc, Enter, or F1 returns to the picker."]
-    offset = 0
+    attributes = {"section": style.heading, "key": style.name,
+                  "desc": style.default, "note": style.help, "blank": 0}
+    lines, lines_width, offset = [], 0, 0
     screen.timeout(200)
     while True:
-        height, _ = screen.getmaxyx()
-        visible = max(1, height - 2)
+        height, width = screen.getmaxyx()
+        if width != lines_width:
+            lines = build_help_lines(max(20, width))
+            lines_width = width
+        visible = max(1, height - 3)
         offset = max(0, min(offset, max(0, len(lines) - visible)))
         screen.erase()
-        for index, line in enumerate(lines[offset:offset + visible]):
-            put(screen, index, 0, line, style.heading if offset + index == 0
-                else style.help)
-        footer = ("Esc/Enter/F1 return" if len(lines) <= visible
-                  else "Up/Down, PageUp/PageDown, Home/End scroll | Esc/Enter/F1 return")
+        put(screen, 0, 0, f"{APP} {VERSION}", style.heading)
+        put_right(screen, 0, "keyboard help", style.muted)
+        put(screen, 1, 0, GLYPH["sep"] * max(1, width - 1), style.muted)
+        for index, segments in enumerate(lines[offset:offset + visible]):
+            x = 0
+            for role, text in segments:
+                put(screen, 2 + index, x, text, attributes[role])
+                x += len(text)
+        if len(lines) <= visible:
+            footer = "Esc, Enter, or F1 returns to the picker"
+        else:
+            last = min(offset + visible, len(lines))
+            footer = (f"lines {offset + 1}-{last} of {len(lines)}   "
+                      "Up/Down, PgUp/PgDn, Home/End scroll | Esc/Enter/F1 return")
         put(screen, height - 1, 0, footer, style.muted)
         screen.refresh()
         try:
