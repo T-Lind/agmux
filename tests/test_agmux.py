@@ -210,6 +210,15 @@ class TmuxIntegration(unittest.TestCase):
         named_id = self.tmux.create(seed_id, self.root, agent="shell")
         self.assertEqual(self.tmux.resolve(seed_id)["id"], named_id)
 
+    def test_tmux_conf_installs_prefixless_bindings(self):
+        self.tmux.run("source-file", str(MODULE.parent / "tmux.conf"))
+        keys = self.tmux.run("list-keys", "-T", "root").splitlines()
+        picker = [line for line in keys if " M-s " in line]
+        killer = [line for line in keys if " M-x " in line]
+        self.assertTrue(any("display-popup" in line for line in picker), picker)
+        self.assertTrue(any("confirm-before" in line and "kill-session" in line
+                            for line in killer), killer)
+
     def test_socket_permission_errors_are_reported(self):
         denied = subprocess.CompletedProcess([], 1, "", "error connecting to /private/tmux (Permission denied)")
         with patch.object(agmux.subprocess, "run", return_value=denied):

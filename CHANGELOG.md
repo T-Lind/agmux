@@ -4,6 +4,13 @@ All notable changes to agmux are documented here. The format is loosely based
 on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [semantic versioning](https://semver.org/).
 
+## [0.6.1]
+
+### Added
+- Prefix-less tmux bindings in the shipped `tmux.conf`: `Alt-s` opens the
+  agmux picker over the current session, and `Alt-x` kills the current session
+  after a `y/n` confirmation. `Ctrl-b Ctrl-s` remains available.
+
 ## [0.6.0]
 
 ### Added
@@ -90,6 +97,7 @@ on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 ## [0.2.0]
 - Agent-aware tmux session manager.
 
+[0.6.1]: https://github.com/T-Lind/agmux/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/T-Lind/agmux/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/T-Lind/agmux/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/T-Lind/agmux/compare/v0.4.0...v0.5.0

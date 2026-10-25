@@ -9,7 +9,7 @@ terminal.
 ![The agmux picker: sessions with agent state, a live preview, and per-session CPU and memory](docs/screenshot.svg)
 
 ```
-agmux 0.6.0                     5 sessions · 2 running · 1 need input · 1 done
+agmux 0.6.1                     5 sessions · 2 running · 1 need input · 1 done
 Codex · 5h 12% · 7d 34%       OpenCode 392K tok · $0.27        Ctrl-G details
 Search:
 ! ty-review    Codex    2w  needs input  cpu 12% · mem 486M  codex  ~/source/repos/ty     2m
@@ -80,7 +80,8 @@ cd agmux
 
 1. links `agmux` (and the historical `cx`) into `~/.local/bin`,
 2. adds bash completion to `~/.bashrc`,
-3. adds the `Ctrl-b Ctrl-s` popup to `~/.tmux.conf`,
+3. adds the `Ctrl-b Ctrl-s` popup and the prefix-less `Alt-s` / `Alt-x`
+   bindings to `~/.tmux.conf`,
 4. installs the `agmux(1)` man page, and
 5. tells you if `~/.local/bin` is missing from `PATH`.
 
@@ -121,6 +122,19 @@ shows the selected session's active pane.
 
 Inside tmux, **`Ctrl-b` then `Ctrl-s`** opens the same picker in a popup and
 switches *your* terminal, leaving the running processes untouched.
+
+The shipped tmux integration also installs two prefix-less bindings so you do
+not need the `Ctrl-b` prefix while attached:
+
+| Binding | Action |
+| --- | --- |
+| `Alt-s` | open the agmux picker over the current session |
+| `Alt-x` | kill the current session after a `y/n` confirmation |
+
+`Alt-x` stops every program in that session and detaches its clients. Use the
+picker's `Ctrl-D` flow instead if you want agmux's typed-name confirmation and
+change revalidation. Terminal support for Alt combinations varies; `Ctrl-b
+Ctrl-s` remains the portable fallback.
 
 ## Command line
 

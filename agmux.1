@@ -1,4 +1,4 @@
-.TH AGMUX 1 "2026" "agmux 0.6.0" "User Commands"
+.TH AGMUX 1 "2026" "agmux 0.6.1" "User Commands"
 .SH NAME
 agmux \- a terminal control panel for tmux and AI coding agents
 .SH SYNOPSIS
@@ -96,7 +96,11 @@ Ctrl\-G usage panel; Ctrl\-R rename; Ctrl\-D delete; Ctrl\-W add shell window;
 Ctrl\-O read\-only viewer; Ctrl\-P toggle preview; Ctrl\-L refresh; Ctrl\-U clear
 search; F1 help; Esc cancel.
 .PP
-Inside tmux, Ctrl\-b then Ctrl\-s opens the picker in a popup.
+Inside tmux, Ctrl\-b then Ctrl\-s opens the picker in a popup. The shipped
+.B tmux.conf
+also binds Alt\-s to the same popup without the prefix, and Alt\-x to kill the
+current session after a y/n confirmation. Alt\-x stops every program in that
+session; the picker's Ctrl\-D flow is the safer, typed\-name alternative.
 .SH CONFIGURATION
 Environment variables override the optional config file
 .B ~/.config/agmux/config

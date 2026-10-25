@@ -65,6 +65,11 @@ contain anything already printed by the program in that pane; use `Ctrl-P` or
   destroyed, and asks you to confirm again. agmux does not change tmux's global
   `detach-on-destroy` and only ever issues `kill-session` for the single
   confirmed target.
+- The shipped `tmux.conf` also binds `Alt-x` to tmux's raw `kill-session` after
+  a `y/n` confirmation. That convenience binding bypasses agmux's typed-name
+  confirmation and snapshot revalidation by design; remove or rebind it if you
+  want every deletion to go through agmux. `Alt-s` opens the ordinary, read-only
+  picker.
 - Adding a shell window uses `new-window -d`, so no attached client is moved and
   no input is injected into any existing pane.
 - The read-only viewer captures output without attaching a tmux client or
@@ -113,7 +118,8 @@ terminal defaults and is never passed through raw escape sequences.
   scrolled in copy mode; tracked agent-pane state after a window switch;
   multi-root repository listing; Codex and OpenCode usage-log/database parsing
   including older OpenCode schemas; notification command execution; and plain
-  piped output.
+  piped output. A tmux integration test also sources `tmux.conf` and checks the
+  prefix-less `Alt-s` / `Alt-x` bindings.
 - Private-terminal checks (`python3 tests/ui_smoke.py`) drive navigation,
   rename, attach/detach, the new-session wizard with a fake agent binary,
   help/usage/preview toggles, no input forwarding from the viewer, switching

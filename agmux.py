@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - sqlite3 is in the standard library
 
 
 APP = "agmux"
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 SELF = Path(__file__).resolve()
 
 

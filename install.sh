@@ -7,8 +7,10 @@
 #   ./install.sh --no-integration    # only link the command
 #   ./install.sh --uninstall         # remove links and the managed blocks
 #
-# Everything is idempotent: the integration lives between markers and is
-# replaced in place, so running it twice is safe.
+# The tmux block installs Ctrl-b Ctrl-s (prefix), Alt-s (open agmux), and
+# Alt-x (kill the current session after confirmation). Everything is
+# idempotent: the integration lives between markers and is replaced in place,
+# so running it twice is safe.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
