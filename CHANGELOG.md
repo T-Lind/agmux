@@ -4,6 +4,16 @@ All notable changes to agmux are documented here. The format is loosely based
 on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [semantic versioning](https://semver.org/).
 
+## [0.6.3]
+
+### Fixed
+- `Alt-s` now passes the real tmux socket path to agmux. `detach-client -E`
+  does not expand tmux formats, so the 0.6.2 binding pointed agmux at the literal
+  string `#{socket_path}` and the picker appeared empty. The binding now resolves
+  the socket path with `run-shell` before detaching, so the same sessions are
+  listed. The smoke test now asserts that a session row is visible after
+  `Alt-s`, not merely that the picker opened.
+
 ## [0.6.2]
 
 ### Changed
@@ -106,6 +116,7 @@ on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 ## [0.2.0]
 - Agent-aware tmux session manager.
 
+[0.6.3]: https://github.com/T-Lind/agmux/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/T-Lind/agmux/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/T-Lind/agmux/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/T-Lind/agmux/compare/v0.5.1...v0.6.0

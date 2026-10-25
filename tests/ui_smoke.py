@@ -154,7 +154,10 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         master, proc = launch(command + ['attach-session', '-t', '=alpha'])
         wait_clients('alpha')
         os.write(master, b'\x1bs')  # Alt-s: detach and run agmux directly
-        wait_output(master, b'agmux 0.')
+        # The footer is drawn after the session rows, so its arrival means the
+        # picker has had a chance to list them too.
+        output = wait_output(master, b'Enter attach')
+        assert b'alpha' in output, output[-1500:]
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if tmux('list-clients', '-F', '#{session_name}') == '':

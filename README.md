@@ -9,7 +9,7 @@ terminal.
 ![The agmux picker: sessions with agent state, a live preview, and per-session CPU and memory](docs/screenshot.svg)
 
 ```
-agmux 0.6.2                     5 sessions · 2 running · 1 need input · 1 done
+agmux 0.6.3                     5 sessions · 2 running · 1 need input · 1 done
 Codex · 5h 12% · 7d 34%       OpenCode 392K tok · $0.27        Ctrl-G details
 Search:
 ! ty-review    Codex    2w  needs input  cpu 12% · mem 486M  codex  ~/source/repos/ty     2m

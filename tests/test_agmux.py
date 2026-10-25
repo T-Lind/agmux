@@ -215,7 +215,7 @@ class TmuxIntegration(unittest.TestCase):
         keys = self.tmux.run("list-keys", "-T", "root").splitlines()
         picker = [line for line in keys if " M-s " in line]
         killer = [line for line in keys if " M-x " in line]
-        self.assertTrue(any("detach-client" in line and "agmux" in line
+        self.assertTrue(any("detach-client" in line and "socket_path" in line
                             for line in picker), picker)
         self.assertTrue(any("confirm-before" in line and "kill-session" in line
                             for line in killer), killer)
