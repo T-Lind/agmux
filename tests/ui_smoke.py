@@ -51,10 +51,10 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
     processes = []
     masters = []
     ttys = {}
-    def launch(args):
+    def launch(args, rows=32, cols=110):
         master, slave = pty.openpty()
         ttys[master] = os.ttyname(slave)
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 110, 0, 0))
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
         proc = subprocess.Popen(args, stdin=slave, stdout=slave, stderr=slave, env=env,
                                 cwd=directory, start_new_session=True)
         os.close(slave)
@@ -172,6 +172,22 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         assert proc.returncode == 0
         print('PASS: help, usage panel, preview toggle, and in-picker read-only viewer')
 
+        master, proc = launch([sys.executable, str(MODULE), '--no-preview'], rows=14, cols=100)
+        wait_output(master, b'agmux 0.')
+        os.write(master, b'\x1bOP')  # F1
+        wait_output(master, b'keyboard help')
+        time.sleep(0.2)
+        os.write(master, b'\x1b[6~')  # PageDown
+        time.sleep(0.2)
+        os.write(master, b'\x1b[6~')
+        wait_output(master, b'no telemetry')
+        os.write(master, b'\r')
+        wait_output(master, b'Enter attach')
+        os.write(master, b'\x1b')
+        proc.wait(timeout=5)
+        assert proc.returncode == 0
+        print('PASS: help panel scrolls on a short terminal')
+
         master, proc = launch([sys.executable, str(MODULE)])
         wait_output(master, b'agmux 0.')
         os.write(master, b'\x0e')
@@ -198,6 +214,33 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         proc.wait(timeout=5)
         assert proc.returncode == 0
         print('PASS: new-session wizard, fake agent launch, and selected directory')
+
+        custom_project = root / 'custom-project'
+        custom_project.mkdir()
+        master, proc = launch([sys.executable, str(MODULE)])
+        wait_output(master, b'agmux 0.')
+        os.write(master, b'\x0e')
+        wait_output(master, b'choose what to run')
+        os.write(master, b'\r')
+        wait_output(master, b'choose a directory')
+        os.write(master, b'Other')
+        time.sleep(0.3)
+        os.write(master, b'\r')
+        wait_output(master, b'Directory (~ is expanded')
+        os.write(master, b'\x15' + str(custom_project).encode() + b'\r')
+        wait_output(master, b'Session name (Ctrl-U clears)')
+        os.write(master, b'\x15custom-path\r')
+        wait_clients('custom-path')
+        deadline = time.monotonic() + 5
+        cwd = ''
+        while cwd != str(custom_project) and time.monotonic() < deadline:
+            cwd = tmux('display-message', '-p', '-t', '=custom-path:', '#{pane_current_path}')
+            time.sleep(0.02)
+        assert cwd == str(custom_project), (cwd, str(custom_project))
+        os.write(master, b'\x02d')
+        proc.wait(timeout=5)
+        assert proc.returncode == 0
+        print('PASS: new-session wizard custom directory path')
 
         tmux('new-session', '-d', '-s', 'victim', '-c', directory)
         tmux('new-session', '-d', '-s', 'bystander', '-c', directory)

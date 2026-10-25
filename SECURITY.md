@@ -12,19 +12,24 @@ network client.
 - Names of immediate directories under `AGMUX_REPOS` (default `~/source/repos`).
 - tmux's local Unix socket, session/client metadata, per-session user options,
   pane working directories, foreground commands, and displayed pane output.
-- The newest Codex session log under `$CODEX_HOME/sessions` (default
-  `~/.codex/sessions`), and only its trailing bytes, to read the `rate_limits`
-  record for the usage panel. No other part of the log is displayed or stored.
+- The newest Codex session logs under `$CODEX_HOME/sessions` (default
+  `~/.codex/sessions`), and only their trailing bytes, to read the most recent
+  `rate_limits` record for the usage panel. No other part of the log is
+  displayed or stored.
 - OpenCode's SQLite database under `$OPENCODE_DATA_DIR` (default
   `~/.local/share/opencode`), opened read-only, and only the session title,
-  cost, token counts, and model of the most recent sessions. No credential,
-  message, or account tables are read.
-- The visible text of a session's active pane, read with `capture-pane`, to
-  label the agent and to classify whether it is working, idle, or waiting on
-  the user, and to trim the agent's input/status chrome from previews.
-- One system process listing (`ps -eo pid=,ppid=,pcpu=,rss=`) to show per-session
-  CPU and memory: only pid, parent pid, CPU percentage, and resident set size
-  are read; process arguments and environments are never requested or shown.
+  cost, token counts (including reasoning/cache when present), model, and update
+  time of the most recent sessions. No credential, message, or account tables
+  are read.
+- The visible text of a session's pane, read with `capture-pane`, to label the
+  agent and to classify whether it is working, idle, or waiting on the user, and
+  to trim the agent's input/status chrome from previews. For agents agmux
+  started, it reads the recorded agent pane even if another window in the same
+  session is currently focused.
+- One system process listing (`ps -eo pid=,ppid=,pcpu=,rss=` or the BSD
+  `ps -A -o pid=,ppid=,pcpu=,rss=` equivalent) to show per-session CPU and
+  memory: only pid, parent pid, CPU percentage, and resident set size are read;
+  process arguments and environments are never requested or shown.
 - An optional `key = value` config file at `$AGMUX_CONFIG` or
   `~/.config/agmux/config`, used only to set defaults for the variables below.
 - Executable locations on `PATH` for tmux and the agent binaries, and the
@@ -103,10 +108,12 @@ terminal defaults and is never passed through raw escape sequences.
   deletion confirmation and cancellation; exact-target deletion leaving other
   sessions intact; refusal when the target changed during confirmation;
   shell-window working-directory and detached behavior; agent detection from a
-  foreground command; per-session CPU/memory sampling; previews ending on the
-  newest output while a pane is scrolled in copy mode; multi-root repository
-  listing; usage-log parsing; notification command execution; and plain piped
-  output.
+  foreground command; per-session CPU/memory sampling (Linux and BSD `ps`
+  forms); previews and state reads ending on the newest output while a pane is
+  scrolled in copy mode; tracked agent-pane state after a window switch;
+  multi-root repository listing; Codex and OpenCode usage-log/database parsing
+  including older OpenCode schemas; notification command execution; and plain
+  piped output.
 - Private-terminal checks (`python3 tests/ui_smoke.py`) drive navigation,
   rename, attach/detach, the new-session wizard with a fake agent binary,
   help/usage/preview toggles, no input forwarding from the viewer, switching

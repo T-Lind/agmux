@@ -1,4 +1,4 @@
-.TH AGMUX 1 "2026" "agmux 0.5.1" "User Commands"
+.TH AGMUX 1 "2026" "agmux 0.6.0" "User Commands"
 .SH NAME
 agmux \- a terminal control panel for tmux and AI coding agents
 .SH SYNOPSIS
@@ -24,6 +24,14 @@ and press Enter to attach (or switch your current tmux client).
 .TP
 .B list, ls
 One line per session with agent, state, directory, and CPU/memory. Add
+.B --json
+for machine\-readable output, or
+.B --no-resources
+to skip the CPU/memory sample.
+.TP
+.B info SESSION
+Show one session's agent, state, directory, panes, attached clients, and
+CPU/memory. Add
 .B --json
 for machine\-readable output.
 .TP
@@ -55,6 +63,9 @@ skips the typed confirmation for that one session.
 .TP
 .B usage
 Show locally available provider usage (Codex rate limits, OpenCode session cost).
+Add
+.B --json
+for machine\-readable output.
 .TP
 .B agents
 List known agents and whether their binaries are installed.
@@ -68,7 +79,8 @@ Read\-only live viewer that never attaches a client or forwards input.
 .B watch
 Notify when any agent starts waiting for input. Options:
 .BR --interval ,
-.BR --once .
+.BR --once ,
+.BR --no-notify .
 .TP
 .B last
 Switch back to the previous session (inside tmux).

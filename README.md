@@ -9,7 +9,7 @@ terminal.
 ![The agmux picker: sessions with agent state, a live preview, and per-session CPU and memory](docs/screenshot.svg)
 
 ```
-agmux 0.5.1                     5 sessions · 2 running · 1 need input · 1 done
+agmux 0.6.0                     5 sessions · 2 running · 1 need input · 1 done
 Codex · 5h 12% · 7d 34%       OpenCode 392K tok · $0.27        Ctrl-G details
 Search:
 ! ty-review    Codex    2w  needs input  cpu 12% · mem 486M  codex  ~/source/repos/ty     2m
@@ -43,17 +43,23 @@ questions and stays out of the way.
   session, summed across all of that session's panes and their child processes —
   machine CPU and RAM, kept visually distinct from token and rate-limit usage.
 - **Tells you when it's done.** Agent sessions started by agmux are flagged
-  `✓` when they finish and fire a desktop notification.
+  `✓` when they finish and fire a desktop notification; attaching to the
+  session clears the flag.
 - **Tells you when it needs you.** If an agent is waiting on a permission or
   confirmation prompt, agmux flags it `!`, sorts it to the top, and can notify
-  you — so you are not left staring at a stalled session.
+  you — so you are not left staring at a stalled session. It keeps watching the
+  agent's own pane even if you switch to another window in that session.
 - **Live previews that stay current.** The preview and the read-only viewer
   render the pane's own colors and styles, always end on the newest output even
   if someone scrolled the pane up, and trim the agent's input composer and
   status footer so you see real output.
 - **Usage at a glance.** Reads Codex's rate-limit windows from its logs and
   OpenCode's per-session cost/tokens from its database, side by side in the
-  header and in a detail panel.
+  header and in a detail panel. `usage --json` makes the same data available to
+  scripts.
+- **Inspect before you act.** `agmux info` shows one session's agent, state,
+  panes, clients, directory, CPU, and memory; `list --json` and `usage --json`
+  cover the rest without scraping the picker.
 - **Portable settings.** An optional config file carries your project roots and
   preferences between machines.
 - **Safe by construction.** No shell command strings, literal argument passing,
@@ -122,6 +128,9 @@ switches *your* terminal, leaving the running processes untouched.
 agmux                                   # the picker
 agmux list                              # one line per session (agent, state, dir, CPU/mem)
 agmux list --json                       # machine-readable sessions
+agmux list --no-resources               # skip the CPU/memory sample
+agmux info ty-review                    # detailed view of one session
+agmux info ty-review --json             # the same details as JSON
 agmux attach upgrades-4                 # switch/attach to a session
 agmux new ty-fix --cwd ~/source/repos/ty
 agmux new review --agent opencode --cwd ~/source/repos/ty --detach
@@ -132,13 +141,14 @@ agmux shell ty-review --name logs       # add a detached shell window
 agmux delete ty-review                  # asks you to type the name
 agmux kill ty-review --yes              # alias of delete, skip the typing
 agmux usage                             # rate-limit windows, read locally
+agmux usage --json                      # Codex limits + OpenCode cost as JSON
 agmux agents                            # known agents and whether they're installed
 agmux preview ty-review                 # recent output, with the pane's colors
 agmux peek ty-review                    # live read-only viewer
 agmux watch                             # notify when an agent needs input
 agmux last                              # previous session (inside tmux)
 agmux detach
-agmux doctor                            # check tools and integration
+agmux doctor                            # check tools, usage sources, and integration
 ```
 
 ### Agents
@@ -151,6 +161,16 @@ actually installed.
 For sessions **started outside agmux**, the agent is inferred from the
 foreground command in the active pane, so an `opencode` or `codex` process is
 labelled even if agmux did not start it.
+
+### Checking your setup
+
+`agmux doctor` prints the resolved tmux socket and version, whether the tmux
+build supports the `Ctrl-b Ctrl-s` popup, where the helper and config live,
+which agent binaries are installed, notification and CPU/memory status, the
+Codex log and OpenCode database sources it can actually read, ASCII/color
+settings, and a session count with how many need input or have finished. It is
+the quickest way to tell "agmux has no data" apart from "agmux is not reading the
+right file".
 
 ### CPU and memory per session
 
@@ -167,14 +187,19 @@ default on platforms without a compatible `ps`. Set `AGMUX_RESOURCES=0` or pass
 agmux list --json | jq '.[] | {name, status, cpu, rss}'
 ```
 
+`list --json` also reports `clients`, `unread`, `agent`, `state`, `prompt`, and
+`cwd`. `agmux info SESSION` adds per-pane detail and the attached client ttys;
+`agmux info SESSION --json` is useful for debugging a session that looks stuck.
+
 ### Previews always show the newest output
 
 The preview and the read-only viewer capture to the *end* of the pane's
 history, so they end on the latest line even when the pane (or the client
 viewing it) has been scrolled up — you always see what the agent is doing now.
 The agent's input composer and status footer are trimmed so real output fills
-the space, and short output hugs the bottom like a real terminal. Toggle the
-preview with `Ctrl-P`; set `AGMUX_TRIM_CHROME=0` to keep the agent chrome.
+the space, and short output hugs the bottom like a real terminal. Trimming
+understands Codex, OpenCode, Claude Code, Gemini, Aider, Crush, and Goose
+footers; set `AGMUX_TRIM_CHROME=0` to keep the agent chrome.
 
 ### Completion notifications
 
@@ -206,10 +231,13 @@ confirmation, or question prompt). Blocked sessions are sorted to the top of the
 picker and flagged `!`, and the picker header counts how many need input. The
 detected prompt line is shown above the preview and appended to `agmux list`.
 
-For agent sessions agmux starts, a small watcher thread polls the pane while the
-agent runs and raises the same desktop/tmux notification for a blocked prompt.
-For sessions started elsewhere, run the standalone watcher, which notifies on
-any transition into the blocked state:
+For agent sessions agmux starts, a small watcher thread polls the agent's pane
+while the agent runs and raises the same desktop/tmux notification for a blocked
+prompt. It remembers which pane it started, so switching to a shell window in
+the same session does not hide a waiting prompt, and it re-notifies if the same
+prompt appears again after the agent resumes. For sessions started elsewhere,
+run the standalone watcher, which notifies on any transition into the blocked
+state:
 
 ```bash
 agmux watch                # poll every few seconds until interrupted
@@ -234,8 +262,11 @@ time — in the header and in the full panel (`Ctrl-G`).
 
 **OpenCode.** OpenCode does not expose account rate limits locally, but it
 stores per-session cost and token counts in its SQLite database. agmux reads
-that (read-only) and shows recent sessions' cost and tokens next to the Codex
-windows. Set `OPENCODE_DATA_DIR` if your database lives elsewhere.
+that (read-only) and shows recent sessions' cost, tokens, and age next to the
+Codex windows. It understands both the older `session` table and the newer
+`session_v2` schema, includes reasoning/cache tokens when recorded, and handles
+timestamps stored in seconds or milliseconds. Set `OPENCODE_DATA_DIR` if your
+database lives elsewhere.
 
 Both are local file reads; agmux makes **no network requests** and reads no
 credentials. Other agents do not expose comparable local data, so the panel
@@ -246,7 +277,8 @@ says so rather than guessing.
 The new-session wizard lists the immediate subdirectories of your **project
 roots** as candidate working directories. By default that is `~/source/repos`;
 set `AGMUX_REPOS` to change it. It accepts several roots separated by `:`, and
-`~` is expanded:
+`~` is expanded. The wizard also offers the current directory, your home
+directory, and an **Other directory** entry where you can type any path:
 
 ```bash
 export AGMUX_REPOS="$HOME/source/repos:$HOME/work:$HOME/notes"
@@ -341,20 +373,23 @@ bash -n install.sh completion.bash
 Both suites use a private tmux socket and a fake agent binary, so they never
 touch your real sessions. The unit suite covers creation, exact selection,
 rename, preview, literal argument quoting, deletion confirmation and
-revalidation, shell windows, agent detection, per-session CPU/memory sampling,
-previews staying on the newest output while scrolled, multi-root project
-listing, ANSI parsing/rendering, screen classification, copy-mode cancellation,
-usage parsing, notifications, config loading, and `NO_COLOR`/piped output. The
-smoke test drives the picker, viewer, usage panel, new-session wizard, popup
-switching, and delete flow end to end.
+revalidation, shell windows, agent detection, per-session CPU/memory sampling
+(including the BSD `ps` fallback), previews staying on the newest output while
+scrolled, tracked agent panes across window switches, multi-root project
+listing, ANSI parsing/rendering, screen classification for Codex/OpenCode/
+Claude/Gemini/Aider prompts, copy-mode cancellation, Codex and OpenCode usage
+parsing (including old OpenCode schemas), notifications, config loading,
+`list`/`info`/`usage` JSON, and `NO_COLOR`/piped output. The smoke test drives
+the picker, viewer, usage panel, new-session wizard, popup switching, and delete
+flow end to end.
 
 ## Compatibility
 
 The command was previously named `cx`; `install.sh` keeps a `cx` symlink, and
 the old `CX_*` environment variables still work. `completion.bash` completes
-both names. Linux is supported; other Unix systems work when their `ps` supports
-`-eo pid=,ppid=,pcpu=,rss=` (macOS mostly does) and otherwise simply show no
-resource figures.
+both names. Linux is supported. Other Unix systems work when their `ps` supports
+`-eo pid=,ppid=,pcpu=,rss=` or `-A -o pid=,ppid=,pcpu=,rss=` (macOS uses the
+latter); otherwise agmux simply shows no resource figures.
 
 ## Uninstall
 

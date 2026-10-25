@@ -1,6 +1,6 @@
 # Source this file from ~/.bashrc.
 _agmux_complete() {
-    local current="${COMP_WORDS[COMP_CWORD]}" word session
+    local current="${COMP_WORDS[COMP_CWORD]}" word session command="${COMP_WORDS[1]}"
     COMPREPLY=()
     if [[ "${COMP_WORDS[COMP_CWORD-1]}" == --cwd ]]; then
         while IFS= read -r word; do COMPREPLY+=("$word"); done < <(compgen -d -- "$current")
@@ -11,23 +11,35 @@ _agmux_complete() {
         )
     elif (( COMP_CWORD == 1 )); then
         while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
-            compgen -W 'pick list ls attach new rename shell delete kill usage agents preview peek last detach doctor names --no-preview --no-notify' -- "$current"
+            compgen -W 'pick list ls info attach new rename shell delete kill usage agents preview peek watch last detach doctor names --no-preview --no-notify --no-resources --version' -- "$current"
         )
-    elif (( COMP_CWORD == 2 )) && [[ "${COMP_WORDS[1]}" == @(attach|rename|shell|delete|kill|preview|peek) ]]; then
+    elif (( COMP_CWORD == 2 )) && [[ "$command" == @(attach|rename|shell|delete|kill|preview|peek|info) ]]; then
         while IFS= read -r session; do
             [[ "$session" == "$current"* ]] && COMPREPLY+=("$session")
         done < <(agmux names 2>/dev/null)
-    elif [[ "${COMP_WORDS[1]}" == new && "$current" == -* ]]; then
+    elif [[ "$command" == new && "$current" == -* ]]; then
         while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
             compgen -W '--agent --cwd --shell --detach --no-notify --' -- "$current"
         )
-    elif [[ "${COMP_WORDS[1]}" == shell && "$current" == -* ]]; then
+    elif [[ "$command" == shell && "$current" == -* ]]; then
         while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
             compgen -W '--name --cwd' -- "$current"
         )
-    elif [[ "${COMP_WORDS[1]}" == @(delete|kill) && "$current" == -* ]]; then
+    elif [[ "$command" == @(delete|kill) && "$current" == -* ]]; then
         while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
             compgen -W '--yes' -- "$current"
+        )
+    elif [[ "$command" == usage && "$current" == -* ]]; then
+        while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
+            compgen -W '--json' -- "$current"
+        )
+    elif [[ "$command" == info && "$current" == -* ]]; then
+        while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
+            compgen -W '--json --no-resources' -- "$current"
+        )
+    elif [[ "$command" == watch && "$current" == -* ]]; then
+        while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
+            compgen -W '--interval --once --no-notify' -- "$current"
         )
     fi
 }

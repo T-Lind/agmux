@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - sqlite3 is in the standard library
 
 
 APP = "agmux"
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 SELF = Path(__file__).resolve()
 
 
@@ -98,7 +98,7 @@ def load_config(path=None):
     return applied
 
 
-load_config()
+CONFIG_APPLIED = load_config()
 
 CODEX_HOME = Path(_env("CODEX_HOME", default=str(Path.home() / ".codex")))
 OPENCODE_HOME = Path(_env("OPENCODE_DATA_DIR", default=str(
@@ -212,19 +212,23 @@ def paint_segments(segments, enabled):
     return "".join(paint(text, role, enabled) for text, role in segments)
 
 
+_ASCII_GLYPHS = {"running": ">", "finished": "*", "blocked": "!", "idle": ".",
+                 "shell": ".", "bar_full": "#", "bar_empty": "-", "sep": "-",
+                 "dot": "*", "mid": " | ", "ellipsis": "..."}
+
+
 def _pick_glyphs():
     if os.environ.get("AGMUX_ASCII"):
-        return {"running": ">", "finished": "*", "blocked": "!", "idle": ".",
-                "shell": ".", "bar_full": "#", "bar_empty": "-", "sep": "-", "dot": "*"}
+        return dict(_ASCII_GLYPHS)
     encoding = sys.stdout.encoding or "utf-8"
     try:
-        "\u25b6\u2713\u00b7\u2588\u2591\u2500\u25cf\u203a".encode(encoding)
+        "\u25b6\u2713\u00b7\u2588\u2591\u2500\u25cf\u203a\u2026".encode(encoding)
     except (LookupError, UnicodeEncodeError):
-        return {"running": ">", "finished": "*", "blocked": "!", "idle": ".",
-                "shell": ".", "bar_full": "#", "bar_empty": "-", "sep": "-", "dot": "*"}
+        return dict(_ASCII_GLYPHS)
     return {"running": "\u25b6", "finished": "\u2713", "blocked": "!",
             "idle": "\u203a", "shell": "\u00b7", "bar_full": "\u2588",
-            "bar_empty": "\u2591", "sep": "\u2500", "dot": "\u25cf"}
+            "bar_empty": "\u2591", "sep": "\u2500", "dot": "\u25cf",
+            "mid": " \u00b7 ", "ellipsis": "\u2026"}
 
 
 GLYPH = _pick_glyphs()
@@ -468,11 +472,14 @@ class AnsiRenderer:
 # AGMUX_WORKING_PATTERNS are '|'-joined regular expressions appended here.
 _BLOCKED_PATTERNS = [
     r"\[y/n\]", r"\(y/n\)", r"\[Y/n\]", r"\[y/N\]", r"\byes/no\b",
+    r"\(y\)es\s*/\s*\(n\)o", r"\[(?:y/n/a|a/y/n|y/n/a)\]",
     r"\ballow\b[^.]*\b(run|command|access|edit|write|execute|this|once|always)\b",
     r"\b(approve|approval|permit|permission)\b",
     r"\bwould you like to\b", r"\bdo you want to\b", r"\bare you sure\b",
     r"\bproceed\?", r"\bcontinue\?", r"\boverwrite\?", r"\bconfirm\?",
+    r"\b(?:apply|accept|reject)\b[^.?]{0,60}\b(?:change|patch|diff|edit|hunk)s?\?",
     r"\bpress (enter|y)\b[^.]*\b(confirm|continue|approve|allow|deny)",
+    r"\bwaiting for (?:your )?(?:input|approval|confirmation|permission)\b",
     r"\bescalat", r"\bneeds? (your )?(input|approval|permission)\b",
     r"^\s*(?:[>\u276f]|\d+[.)])\s*(?:yes|allow|approve|deny|no)\b",
     r"\b(would|do|does|shall|should|can|could|may)\b[^?]{0,120}\?\s*$",
@@ -481,12 +488,20 @@ _WORKING_PATTERNS = [
     r"esc to interrupt", r"\besc\b[^.]*\binterrupt\b", r"ctrl\+c to (cancel|stop|interrupt)",
     r"press esc[^.]*\b(stop|cancel|interrupt)\b", r"working\s*(?:\(|\u2022|\.\.\.)",
     r"thinking\s*(?:\(|\u2022|\.\.\.)", r"esc replaces",
+    r"\b(?:generating|searching|reading|running|building|analyzing)\b[^.]{0,80}"
+    r"\b(?:esc|ctrl\+c)\b[^.]{0,40}\b(?:cancel|stop|interrupt)\b",
 ]
+
+_PATTERN_CACHE = {}
 
 
 def _compile_patterns(defaults, extra_env):
-    patterns = list(defaults)
     extra = os.environ.get(extra_env)
+    key = (tuple(defaults), extra_env, extra)
+    cached = _PATTERN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    patterns = list(defaults)
     if extra:
         patterns.extend(part for part in extra.split("|") if part)
     compiled = []
@@ -495,6 +510,7 @@ def _compile_patterns(defaults, extra_env):
             compiled.append(re.compile(pattern, re.IGNORECASE))
         except re.error:
             continue
+    _PATTERN_CACHE[key] = compiled
     return compiled
 
 
@@ -529,8 +545,18 @@ _BOX_CHARS = set(chr(code) for code in range(0x2500, 0x25A0)) | \
 
 # Agents draw a fixed input composer and status footer at the bottom of their
 # TUIs. It is the same every time and hides real output, so previews drop it.
-_CODEX_COMPOSER = re.compile(r"^[\u203a\u276f>]\s")
+_CODEX_COMPOSER = re.compile(r"^(?:[\u203a\u276f>]|[\u2502|]\s*[\u203a\u276f>])\s")
 _CODEX_STATUS = re.compile(r"\b(?:xhigh|high|medium|low|minimal)\b\s*\u00b7")
+
+# Footer text that agents use for their own composer/status chrome. These are
+# deliberately specific UI phrases, not generic words that also occur in real
+# agent output, and never include live-work lines such as "esc to interrupt".
+_CHROME_FOOTER = re.compile(
+    r"(?:\? for shortcuts|for shortcuts|accept edits|auto[- ]?accept|"
+    r"shift\+tab|ctrl\+p commands|ctrl\+o|ctrl\+t|type your message|"
+    r"context left|tokens? (?:used|left)|diffs? ·|quit ·|/help)", re.IGNORECASE)
+_CHROME_COMPOSER = re.compile(r"^(?:[\u2502|]\s*)?[\u203a\u276f>]\s")
+_AIDER_FOOTER = re.compile(r"^tokens:.*\bcost:", re.IGNORECASE)
 
 
 def _classify_chrome(agent, line):
@@ -556,6 +582,20 @@ def _classify_chrome(agent, line):
         if re.search(r"\b(?:Build|Plan|Agent)\b", stripped) and "\u00b7" in stripped:
             return "weak"
         if all(ch in _BOX_CHARS for ch in stripped):
+            return "weak"
+        return None
+    if agent == "aider":
+        if stripped.startswith("aider>") or _AIDER_FOOTER.search(stripped):
+            return "strong"
+        if all(ch in _BOX_CHARS for ch in stripped):
+            return "weak"
+        return None
+    if agent in ("claude", "gemini", "crush", "goose"):
+        if _CHROME_FOOTER.search(stripped) or _CHROME_COMPOSER.match(stripped):
+            return "strong"
+        if all(ch in _BOX_CHARS for ch in stripped):
+            return "weak"
+        if stripped[0] in "\u256d\u2570\u2502\u2500\u256e\u256f":
             return "weak"
         return None
     return None
@@ -648,8 +688,13 @@ def _last_rate_limits(path, tail_bytes=1_500_000):
             record = json.loads(line)
         except ValueError:
             continue
-        limits = record.get("payload", {}).get("rate_limits")
-        if limits:
+        if not isinstance(record, dict):
+            continue
+        payload = record.get("payload")
+        limits = payload.get("rate_limits") if isinstance(payload, dict) else None
+        if not limits:
+            limits = record.get("rate_limits")
+        if isinstance(limits, dict) and limits:
             return limits
     return None
 
@@ -660,7 +705,7 @@ def find_codex_rate_limits():
         return None
     try:
         files = sorted(sessions.rglob("rollout-*.jsonl"),
-                       key=lambda p: p.stat().st_mtime, reverse=True)[:8]
+                       key=lambda p: p.stat().st_mtime, reverse=True)[:12]
     except OSError:
         return None
     for path in files:
@@ -686,12 +731,15 @@ def humanize_tokens(count):
     if count >= 1_000_000:
         return f"{count / 1_000_000:.1f}M"
     if count >= 1_000:
-        return f"{count / 1_000:.0f}K"
+        value = count / 1_000
+        return f"{value:.1f}K" if value < 10 else f"{value:.0f}K"
     return str(count)
 
 
 def money(value):
     value = float(value or 0)
+    if value <= 0:
+        return "$0"
     return f"${value:.2f}" if value >= 0.01 else f"${value:.4f}"
 
 
@@ -703,9 +751,37 @@ def model_label(model):
         data = json.loads(model) if isinstance(model, str) else model
         name = data.get("id", "")
         provider = data.get("providerID", "")
-        return f"{provider}/{name}" if provider else name
-    except (ValueError, AttributeError):
+        if provider and name:
+            return f"{provider}/{name}"
+        return name or provider or ""
+    except (ValueError, AttributeError, TypeError):
         return str(model)[:40]
+
+
+def _opencode_schema(connection):
+    """Find a session table this OpenCode version uses.
+
+    OpenCode has shipped both ``session`` and ``session_v2``; the token columns
+    also vary. Detect what is present instead of failing on a schema change.
+    """
+    for table in ("session_v2", "session"):
+        try:
+            columns = {row[1] for row in
+                       connection.execute(f'pragma table_info("{table}")')}
+        except sqlite3.Error:
+            continue
+        if {"title", "cost", "model", "time_updated"} <= columns:
+            return table, columns
+    return None, set()
+
+
+def _to_epoch(value):
+    """Normalize a stored timestamp that may be seconds or milliseconds."""
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return number // 1000 if number > 10**11 else number
 
 
 def opencode_usage(max_age=30.0):
@@ -713,6 +789,7 @@ def opencode_usage(max_age=30.0):
 
     OpenCode stores per-session cost and token counts locally. It does not
     expose account rate limits, so this reports the sessions agmux can see.
+    Older and newer OpenCode schema names are both supported.
     """
     now = time.monotonic()
     if now - _OPENCODE_CACHE["at"] <= max_age:
@@ -722,18 +799,35 @@ def opencode_usage(max_age=30.0):
         try:
             connection = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True, timeout=1)
             try:
-                rows = connection.execute(
-                    "select title, cost, tokens_input, tokens_output, model, time_updated "
-                    "from session_v2 order by time_updated desc limit 5").fetchall()
+                table, columns = _opencode_schema(connection)
+                if table:
+                    expressions = ["title", "cost", "model", "time_updated"]
+                    token_columns = ("tokens_input", "tokens_output", "tokens_reasoning",
+                                     "tokens_cache_read", "tokens_cache_write")
+                    for column in token_columns:
+                        expressions.append(column if column in columns else "0")
+                    rows = connection.execute(
+                        f"select {', '.join(expressions)} from {table} "
+                        "order by time_updated desc limit 5").fetchall()
+                else:
+                    rows = []
             finally:
                 connection.close()
-            sessions = [dict(title=title or "", cost=float(cost or 0),
-                             tokens=int(tin or 0) + int(tout or 0),
-                             model=model_label(model), updated=int(updated or 0))
-                        for title, cost, tin, tout, model, updated in rows]
+            sessions = []
+            for row in rows:
+                (title, cost, model, updated,
+                 tin, tout, reasoning, cache_read, cache_write) = row
+                counts = [max(0, int(value or 0))
+                          for value in (tin, tout, reasoning, cache_read, cache_write)]
+                sessions.append(dict(
+                    title=title or "", cost=float(cost or 0),
+                    tokens=sum(counts), input=counts[0], output=counts[1],
+                    reasoning=counts[2], cache_read=counts[3], cache_write=counts[4],
+                    model=model_label(model), updated=_to_epoch(updated)))
             if sessions:
-                data = dict(latest=sessions[0], sessions=sessions)
-        except (sqlite3.Error, OSError, ValueError):
+                data = dict(latest=sessions[0], sessions=sessions, table=table,
+                            source=str(OPENCODE_DB))
+        except (sqlite3.Error, OSError, ValueError, TypeError):
             data = None
     _OPENCODE_CACHE["at"] = now
     _OPENCODE_CACHE["data"] = data
@@ -745,7 +839,7 @@ def opencode_inline(usage=None):
     if not usage:
         return ""
     latest = usage["latest"]
-    return f"OpenCode {humanize_tokens(latest['tokens'])} tok \u00b7 {money(latest['cost'])}"
+    return f"OpenCode {humanize_tokens(latest['tokens'])} tok{GLYPH['mid']}{money(latest['cost'])}"
 
 
 def usage_inline(limits=None):
@@ -759,7 +853,7 @@ def usage_inline(limits=None):
         if percent is None:
             continue
         parts.append(f"{window_label(window.get('window_minutes'))} {round(percent):.0f}%")
-    return " \u00b7 ".join(parts) if len(parts) > 1 else ""
+    return GLYPH["mid"].join(parts) if len(parts) > 1 else ""
 
 
 def usage_report(width=20, limits=None, opencode=None):
@@ -792,10 +886,13 @@ def usage_report(width=20, limits=None, opencode=None):
     if opencode:
         for session in opencode["sessions"][:4]:
             title = clean(session["title"] or "(untitled)")[:40]
+            age = humanize_age(session.get("updated"))
+            age_text = f"  {age} ago" if age else ""
             lines.append((f"  {title:<42} {humanize_tokens(session['tokens']):>6} tok  "
-                          f"{money(session['cost'])}", "default"))
-        lines.append(("  (OpenCode has no local account rate limits; showing session cost.)",
-                      "muted"))
+                          f"{money(session['cost'])}{age_text}", "default"))
+        source = opencode.get("table") or "local database"
+        lines.append((f"  (OpenCode has no local account rate limits; "
+                      f"showing session cost from {source}.)", "muted"))
     else:
         lines.append(("  No local OpenCode usage found.", "muted"))
     return lines
@@ -833,10 +930,19 @@ def _process_table(max_age=1.5):
     if _PS_CACHE["data"] is not None and now - _PS_CACHE["at"] <= max_age:
         return _PS_CACHE["data"]
     table = {}
-    try:
-        result = subprocess.run(["ps", "-eo", "pid=,ppid=,pcpu=,rss="], text=True,
-                                errors="replace", stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, timeout=4)
+    # Linux accepts ``-e``; BSD/macOS wants ``-A``. Try both so a ps flavour
+    # change degrades to a working sample rather than silently losing figures.
+    environment = dict(os.environ, LC_ALL="C")
+    for args in (["ps", "-eo", "pid=,ppid=,pcpu=,rss="],
+                 ["ps", "-A", "-o", "pid=,ppid=,pcpu=,rss="]):
+        try:
+            result = subprocess.run(args, text=True, errors="replace",
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=4, env=environment)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            continue
+        if not result.stdout.strip():
+            continue
         for line in result.stdout.splitlines():
             fields = line.split()
             if len(fields) != 4:
@@ -845,20 +951,26 @@ def _process_table(max_age=1.5):
                 table[int(fields[0])] = (int(fields[1]), float(fields[2]), int(fields[3]))
             except ValueError:
                 continue
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        table = {}
+        if table:
+            break
     _PS_CACHE["at"], _PS_CACHE["data"] = now, table
     return table
 
 
-def process_usage(root_pids, table=None):
+def _children_map(table):
+    children = {}
+    for pid, (ppid, _, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def process_usage(root_pids, table=None, children=None):
     """(cpu_percent, rss_kib) summed over a set of process trees."""
     table = _process_table() if table is None else table
     if not table:
         return 0.0, 0
-    children = {}
-    for pid, (ppid, _, _) in table.items():
-        children.setdefault(ppid, []).append(pid)
+    if children is None:
+        children = _children_map(table)
     cpu = rss = 0.0
     seen = set()
     stack = [pid for pid in root_pids if pid in table]
@@ -885,7 +997,7 @@ def resource_label(cpu, rss):
         parts.append(f"cpu {cpu:.0f}%")
     if rss:
         parts.append(f"mem {humanize_size(rss)}")
-    return " \u00b7 ".join(parts)
+    return GLYPH["mid"].join(parts)
 
 
 # --------------------------------------------------------------------------
@@ -894,7 +1006,8 @@ def resource_label(cpu, rss):
 
 _SESSION_FIELDS = ("session_id", "session_name", "session_windows", "session_attached",
                    "session_activity", "session_created",
-                   "@agmux_agent", "@agmux_status", "@agmux_unread", "@agmux_finished")
+                   "@agmux_agent", "@agmux_status", "@agmux_unread", "@agmux_finished",
+                   "@agmux_pane")
 
 
 class Tmux:
@@ -929,11 +1042,12 @@ class Tmux:
             if len(fields) != len(_SESSION_FIELDS):
                 continue
             (sid, name, windows, attached, activity, created,
-             agent, status, unread, finished) = fields
+             agent, status, unread, finished, agent_pane) = fields
             rows.append(dict(id=sid, name=name, windows=int(windows), attached=int(attached),
                              activity=int(activity or 0), created=int(created or 0),
                              agent=agent or "", status=status or "",
-                             unread=int(unread or 0), finished=int(finished or 0)))
+                             unread=int(unread or 0), finished=int(finished or 0),
+                             agent_pane=agent_pane or ""))
         return sorted(rows, key=lambda row: (-row["activity"], row["name"]))
 
     def session_details(self, detect=False, resources=False):
@@ -943,11 +1057,17 @@ class Tmux:
         fmt = "\t".join("#{" + key + "}" for key in
                         ("session_id", "window_active", "pane_active",
                          "pane_current_command", "pane_current_path", "pane_id"))
-        active = {}
+        panes, active = {}, {}
         for line in self.run("list-panes", "-a", "-F", fmt, optional=True).splitlines():
             fields = line.split("\t", 5)
-            if len(fields) == 6 and fields[1:3] == ["1", "1"]:
-                active[fields[0]] = dict(process=fields[3], cwd=fields[4], pane=fields[5])
+            if len(fields) != 6:
+                continue
+            session_id, window_active, pane_active, process, cwd, pane = fields
+            entry = dict(session=session_id, process=process, cwd=cwd, pane=pane,
+                         active=window_active == "1" and pane_active == "1")
+            panes[pane] = entry
+            if entry["active"]:
+                active[session_id] = entry
         usage = self.session_resources() if resources else {}
         for row in rows:
             info = active.get(row["id"], {"process": "", "cwd": "", "pane": ""})
@@ -960,13 +1080,18 @@ class Tmux:
             if not row["agent"]:
                 detected = detect_agent(row["process"])
                 row["agent"] = detected.key if detected else ""
-            if (detect and row["agent"] and row["agent"] != "shell" and row["pane"]
-                    and row["process"] not in SHELL_COMMANDS):
+            # Prefer the pane where agmux launched the agent, so switching to a
+            # shell window in the same session does not hide a waiting prompt.
+            state = panes.get(row.get("agent_pane") or "")
+            if not state or state["session"] != row["id"]:
+                state = panes.get(row["pane"])
+            if (detect and row["agent"] and row["agent"] != "shell" and state
+                    and state["process"] not in SHELL_COMMANDS):
                 try:
-                    state, prompt = classify_screen(self.pane_lines(row["pane"]))
+                    state_name, prompt = classify_screen(self.pane_lines(state["pane"]))
                 except Error:
-                    state, prompt = "", ""
-                row["state"], row["prompt"] = state, prompt
+                    state_name, prompt = "", ""
+                row["state"], row["prompt"] = state_name, prompt
         return rows
 
     def pane_pids(self):
@@ -986,12 +1111,18 @@ class Tmux:
         table = _process_table()
         if not table:
             return {}
-        return {sid: process_usage(pids, table) for sid, pids in self.pane_pids().items()}
-
+        children = _children_map(table)
+        return {sid: process_usage(pids, table, children)
+                for sid, pids in self.pane_pids().items()}
 
     def pane_lines(self, target, lines=24):
-        """Visible screen text of a pane (target may be a pane id or 'session:')."""
-        return self.run("capture-pane", "-p", "-t", target, "-S", f"-{lines}").splitlines()
+        """Visible screen text of a pane, pinned to its newest output.
+
+        ``-E -`` means classification never reads a stale scrolled-back view
+        when a user has left the pane in copy mode.
+        """
+        return self.run("capture-pane", "-p", "-t", target, "-S", f"-{lines}",
+                        "-E", "-").splitlines()
 
     def resolve(self, target):
         rows = self.sessions()
@@ -1064,8 +1195,17 @@ class Tmux:
         self.run("set-option", "-t", sid, "@" + name, str(value))
 
     def mark_read(self, sid):
+        """Clear the unread/finished badge once the user has looked at a session.
+
+        The agent wrapper records ``finished`` so the picker can raise a check
+        mark. Attaching means the user has seen it, so also move the state on to
+        ``idle``; otherwise the check mark would stay forever.
+        """
         try:
             self.session_option(sid, "agmux_unread", "0")
+            if any(row["id"] == sid and row["status"] == "finished"
+                   for row in self.sessions()):
+                self.session_option(sid, "agmux_status", "idle")
         except Error:
             pass
 
@@ -1255,7 +1395,11 @@ def repos():
 
 
 def short_path(directory):
-    prefix = str(Path.home()) + os.sep
+    directory = str(directory or "")
+    home = str(Path.home())
+    if directory == home:
+        return "~"
+    prefix = home + os.sep
     return "~/" + directory[len(prefix):] if directory.startswith(prefix) else directory
 
 
@@ -1275,20 +1419,29 @@ def row_status(row):
 
     ``blocked`` means the agent looks like it is waiting on the user (a
     permission or confirmation prompt); ``idle`` means it is alive but at its
-    prompt rather than working.
+    prompt rather than working. A tracked agent whose process has exited and
+    left a login shell behind is idle rather than perennially running.
     """
-    if row.get("unread") or row.get("status") == "finished":
+    if row.get("unread"):
         return "finished"
+    status = row.get("status")
     state = row.get("state")
+    agent = row.get("agent")
+    if status == "finished":
+        return "finished"
     if state == "blocked":
         return "blocked"
     if state == "working":
         return "running"
     if state == "idle":
-        return "idle" if row.get("agent") and row["agent"] != "shell" else "shell"
-    if row.get("status") == "running":
+        return "idle" if agent and agent != "shell" else "shell"
+    if status in ("idle", "read"):
+        return "idle" if agent and agent != "shell" else "shell"
+    if status == "running":
         return "running"
-    if row.get("agent") and row["agent"] != "shell":
+    if agent and agent != "shell":
+        if row.get("process") in SHELL_COMMANDS:
+            return "idle"
         return "running"
     return "shell"
 
@@ -1312,6 +1465,7 @@ def notify_default():
 
 def _run_notification(title, body, session, exit_code=-1):
     """Best-effort desktop/terminal notice. Never blocks or raises."""
+    title, body, session = clean(title), clean(body), clean(session)
     custom = os.environ.get("AGMUX_NOTIFY_CMD")
     if custom:
         try:
@@ -1320,7 +1474,7 @@ def _run_notification(title, body, session, exit_code=-1):
             if parts:
                 subprocess.Popen(parts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return
-        except (ValueError, OSError):
+        except (ValueError, OSError, KeyError, IndexError):
             pass
     if shutil.which("notify-send") and _env("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"):
         try:
@@ -1353,18 +1507,32 @@ def watch_interval():
         return 3.0
 
 
-def watch_blocked(tmux, sid, label, session, stop_event, interval):
+def blocked_transition(previous_prompt, state, prompt):
+    """Track when a blocked prompt is new.
+
+    Returns ``(prompt_to_notify_or_None, next_previous_prompt)``. Leaving the
+    blocked state clears the memory, so the same prompt asks again later and is
+    notified again.
+    """
+    if state != "blocked":
+        return None, None
+    if prompt and prompt != previous_prompt:
+        return prompt, prompt
+    return None, previous_prompt
+
+
+def watch_blocked(tmux, target, label, session, stop_event, interval):
     """While an agent runs, poll its pane and notify on a new blocked prompt."""
     last_prompt = None
     while not stop_event.wait(interval):
         try:
-            lines = tmux.pane_lines(f"{sid}:")
+            lines = tmux.pane_lines(target)
         except Error:
             continue
         state, prompt = classify_screen(lines)
-        if state == "blocked" and prompt and prompt != last_prompt:
-            last_prompt = prompt
-            send_blocked_notification(label, session, prompt)
+        notice, last_prompt = blocked_transition(last_prompt, state, prompt)
+        if notice:
+            send_blocked_notification(label, session, notice)
 
 
 def launch_agent(agent_key, executable, shell, session, arguments, notify_enabled):
@@ -1382,6 +1550,7 @@ def launch_agent(agent_key, executable, shell, session, arguments, notify_enable
         sid = tmux.current_session_id()
     except Error:
         pass
+    pane = os.environ.get("TMUX_PANE") or ""
 
     def set_option(key, value):
         if tmux and sid:
@@ -1394,14 +1563,17 @@ def launch_agent(agent_key, executable, shell, session, arguments, notify_enable
     set_option("agmux_status", "running")
     set_option("agmux_started", str(int(time.time())))
     set_option("agmux_unread", "0")
+    if pane:
+        set_option("agmux_pane", pane)
 
     started = time.time()
     code = 0
     stop_event = threading.Event()
     if tmux and sid and notify_enabled:
+        target = pane or f"{sid}:"
         threading.Thread(target=watch_blocked,
-                         args=(tmux, sid, profile.label, session, stop_event, watch_interval()),
-                         daemon=True).start()
+                         args=(tmux, target, profile.label, session, stop_event,
+                               watch_interval()), daemon=True).start()
     try:
         child = subprocess.Popen([executable, *arguments])
         while True:
@@ -1643,17 +1815,38 @@ def show_help(screen, style=None):
              "This helper reads local tmux output, directory names, and Codex usage",
              "logs. It has no telemetry and makes no network requests.", "",
              "Esc, Enter, or F1 returns to the picker."]
-    screen.erase()
-    for index, line in enumerate(lines):
-        put(screen, index, 0, line, style.heading if index == 0 else style.help)
-    screen.refresh()
+    offset = 0
+    screen.timeout(200)
     while True:
+        height, _ = screen.getmaxyx()
+        visible = max(1, height - 2)
+        offset = max(0, min(offset, max(0, len(lines) - visible)))
+        screen.erase()
+        for index, line in enumerate(lines[offset:offset + visible]):
+            put(screen, index, 0, line, style.heading if offset + index == 0
+                else style.help)
+        footer = ("Esc/Enter/F1 return" if len(lines) <= visible
+                  else "Up/Down, PageUp/PageDown, Home/End scroll | Esc/Enter/F1 return")
+        put(screen, height - 1, 0, footer, style.muted)
+        screen.refresh()
         try:
             key = screen.get_wch()
         except curses.error:
             continue
         if key in ("\x1b", "\x03", "\n", "\r", curses.KEY_ENTER, curses.KEY_F1):
             return
+        if key == curses.KEY_UP:
+            offset -= 1
+        elif key == curses.KEY_DOWN:
+            offset += 1
+        elif key == curses.KEY_PPAGE:
+            offset -= visible
+        elif key == curses.KEY_NPAGE:
+            offset += visible
+        elif key == curses.KEY_HOME:
+            offset = 0
+        elif key == curses.KEY_END:
+            offset = len(lines)
 
 
 def show_usage_panel(screen, style=None):
@@ -1662,7 +1855,7 @@ def show_usage_panel(screen, style=None):
     screen.timeout(-1)
     screen.erase()
     put(screen, 0, 0, f"{APP} usage limits", style.heading)
-    put(screen, 1, 0, "Read locally from Codex session logs. No network requests.",
+    put(screen, 1, 0, "Read locally from Codex logs and OpenCode's database.",
         style.help)
     for index, (text, role) in enumerate(usage_report(width)):
         put(screen, 3 + index, 0, text, getattr(style, role, 0))
@@ -1774,7 +1967,8 @@ def draw_row(screen, y, row, selected, style):
         segments.append(("  needs input", "warning"))
     segments.append((f"  {row['windows']}w", "muted"))
     if row["attached"]:
-        segments.append(("  attached", "attached"))
+        label = "attached" if row["attached"] == 1 else f"{row['attached']} clients"
+        segments.append(("  " + label, "attached"))
     resource = resource_label(row.get("cpu"), row.get("rss"))
     if resource:
         segments.append(("  " + resource, "secondary"))
@@ -1846,6 +2040,9 @@ def choose(screen, title, options, style, hint="Up/Down select | Enter confirm |
             query += key
 
 
+_CUSTOM_DIRECTORY = "@custom-directory"
+
+
 def new_session_flow(screen, tmux, style, notify=True):
     """Ctrl-N wizard: choose an agent, a directory, then a name."""
     options = []
@@ -1869,10 +2066,20 @@ def new_session_flow(screen, tmux, style, notify=True):
     except Error:
         pass
     directories.append(dict(label="~", note="home directory", value=str(Path.home())))
+    directories.append(dict(label="Other directory", note="type any path",
+                            value=_CUSTOM_DIRECTORY))
     cwd = choose(screen, f"New {AGENTS[agent].label} session - choose a directory",
                  directories, style)
     if cwd is None:
         return None
+    if cwd == _CUSTOM_DIRECTORY:
+        typed = prompt(screen, "Directory (~ is expanded; Ctrl-U clears)",
+                       str(Path.cwd()), style)
+        if typed is None:
+            return None
+        cwd = str(Path(typed).expanduser())
+        if not Path(cwd).is_dir():
+            raise Error(f"Directory does not exist: {cwd}")
 
     suggestion = default_name(cwd, tmux.sessions(), agent)
     name = prompt(screen, "Session name (Ctrl-U clears)", suggestion, style)
@@ -1928,16 +2135,29 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
         running = statuses.count("running")
         finished = statuses.count("finished")
         blocked = statuses.count("blocked")
-        summary = f"{len(rows)} sessions \u00b7 {running} running"
+        mid = GLYPH["mid"]
+        title = f"{APP} {VERSION}"
+        summary = (f"{len(rows)} sessions{mid}{running} running")
         if blocked:
-            summary += f" \u00b7 {blocked} need input"
-        summary += f" \u00b7 {finished} done"
-        put(screen, 0, 0, f"{APP} {VERSION}", style.heading)
+            summary += f"{mid}{blocked} need input"
+        summary += f"{mid}{finished} done"
+        if len(title) + len(summary) + 2 > width:
+            summary = f"{len(rows)} sessions{mid}{running} running"
+            if blocked:
+                summary += f"{mid}{blocked}!"
+        if len(title) + len(summary) + 2 > width:
+            summary = f"{len(rows)}/{running}"
+        put(screen, 0, 0, title, style.heading)
         put_right(screen, 0, summary, style.warning if blocked else style.muted)
         usage = "    ".join(part for part in (usage_inline(), opencode_inline()) if part)
         if usage:
-            put(screen, 1, 0, usage, style.muted)
-            put_right(screen, 1, "Ctrl-G details", style.help)
+            detail = "Ctrl-G details"
+            room = width - len(detail) - 3
+            if room >= 8:
+                put(screen, 1, 0, usage[:room], style.muted)
+                put_right(screen, 1, detail, style.help)
+            else:
+                put(screen, 1, 0, usage, style.muted)
         else:
             put(screen, 1, 0, "Ctrl-N new session   Ctrl-G usage   F1 help", style.help)
         put(screen, 2, 0, f"Search: {query}", style.heading)
@@ -1983,7 +2203,7 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
                     put_runs(screen, top + index, runs, renderer)
         footer = (message or f"{len(matches)} of {len(rows)} sessions   "
                   "Enter attach \u00b7 Ctrl-N new \u00b7 Ctrl-R rename \u00b7 "
-                  "Ctrl-D delete \u00b7 F1 help")
+                  "Ctrl-D delete \u00b7 F1 help").replace("\u00b7", GLYPH["mid"].strip())
         put(screen, height - 1, 0, footer, style.warning if message_alert else style.muted)
         screen.refresh()
         try:
@@ -2091,10 +2311,49 @@ def session_record(row):
     return dict(id=row["id"], name=row["name"], agent=row.get("agent") or "",
                 agent_label=agent.label if agent and not agent.is_shell else "",
                 status=row_status(row), state=row.get("state") or "",
-                attached=bool(row["attached"]), windows=row["windows"],
+                attached=bool(row["attached"]), clients=int(row.get("attached") or 0),
+                windows=row["windows"], unread=int(row.get("unread") or 0),
                 process=row.get("process") or "", cwd=row.get("cwd") or "",
                 cpu=round(float(row.get("cpu") or 0.0), 1), rss=row.get("rss") or 0,
-                prompt=row.get("prompt") or "", activity=row.get("activity"))
+                prompt=row.get("prompt") or "", activity=row.get("activity"),
+                agent_pane=row.get("agent_pane") or "")
+
+
+def info_record(tmux, target, resources=True):
+    """Detailed, machine-readable view of one resolved session."""
+    resolved = tmux.resolve(target)
+    details = next((row for row in tmux.session_details(detect=True, resources=resources)
+                    if row["id"] == resolved["id"]), None)
+    if details is None:
+        raise Error("That session no longer exists.")
+    info = tmux.describe(resolved["id"])
+    record = session_record(details)
+    record["panes"] = info["panes"]
+    record["pane_count"] = info["pane_count"]
+    record["client_ttys"] = info["clients"]
+    return record
+
+
+def info_lines(record, enabled=False):
+    """Human-readable detail view used by ``agmux info``."""
+    label = record.get("agent_label") or "Shell"
+    lines = [paint(f"{clean(record['name'])}  ({record['id']})", "heading", enabled)]
+    lines.append(f"  agent: {label}   status: {record['status']}   "
+                 f"clients: {record['clients']}   windows: {record['windows']}")
+    lines.append(f"  process: {clean(record.get('process') or '-')}   "
+                 f"directory: {paint(short_path(record.get('cwd') or ''), 'muted', enabled)}")
+    resource = resource_label(record.get("cpu"), record.get("rss"))
+    if resource:
+        lines.append(f"  {resource}")
+    if record.get("prompt"):
+        lines.append(paint(f"  needs input: {clean(record['prompt'])}", "warning", enabled))
+    for pane in record.get("panes", []):
+        marker = "*" if pane["active"] else " "
+        lines.append(f"  {marker} window {pane['window']}: "
+                     f"{clean(pane['command'])}  {short_path(pane['path'])}")
+    if record.get("client_ttys"):
+        lines.append("  clients: " + ", ".join(clean(tty) for tty in record["client_ttys"]))
+    return lines
 
 
 def list_line(row, enabled):
@@ -2106,7 +2365,13 @@ def list_line(row, enabled):
     role = {"finished": "finished", "running": "attached",
             "blocked": "warning", "idle": "muted"}.get(status, "muted")
     name = f"{clean(row['name']):<28}"
-    state = f"{'attached' if row['attached'] else 'detached':<8}"
+    if row["attached"] == 1:
+        state_text = "attached"
+    elif row["attached"]:
+        state_text = f"{row['attached']} clients"
+    else:
+        state_text = "detached"
+    state = f"{state_text:<8}"
     segments = [(f"{glyph} ", role), (name, "heading")]
     if agent and not agent.is_shell:
         segments.append((f" {agent.label:<9}", agent.accent))
@@ -2120,8 +2385,8 @@ def list_line(row, enabled):
         segments.append(("  " + resource, "secondary"))
     if status == "blocked" and row.get("prompt"):
         segments.append(("  needs input: " + row["prompt"][:100], "warning"))
-    elif row["unread"]:
-        segments.append(("  " + GLYPH["finished"], "finished"))
+    elif status == "finished":
+        segments.append(("  finished", "finished"))
     return paint_segments(segments, enabled)
 
 
@@ -2130,27 +2395,62 @@ def list_lines(tmux, enabled, resources=True):
         print(list_line(row, enabled))
 
 
+def _tmux_command_available(tmux, name):
+    try:
+        tmux.run("list-commands", name, optional=True)
+        return True
+    except Error:
+        return False
+
+
 def doctor(tmux):
     print(f"{APP} {VERSION}")
-    print(f"tmux: {tmux.run('-V')}")
+    version = tmux.run("-V")
+    print(f"tmux: {version}")
     print(f"Helper: {SELF}")
+    print(f"Python: {sys.version.split()[0]} ({sys.executable})")
+    socket = _env("AGMUX_TMUX_SOCKET", "CX_TMUX_SOCKET")
+    print(f"tmux socket: {socket or 'current/default'}")
     print(f"Inside tmux: {'yes' if os.environ.get('TMUX') else 'no'}")
+    popup = _tmux_command_available(tmux, "display-popup")
+    print(f"Popup integration: {'supported' if popup else 'not supported by this tmux'}")
     print(f"Repositories: {', '.join(str(path) for path in repos_roots())}")
-    print(f"Config file: {config_path()} "
-          f"({'present' if config_path().is_file() else 'not present'})")
+    config = config_path()
+    print(f"Config file: {config} "
+          f"({'present' if config.is_file() else 'not present'})")
+    if CONFIG_APPLIED:
+        print(f"Config applied: {', '.join(sorted(CONFIG_APPLIED))}")
     print(f"Default agent: {DEFAULT_AGENT}")
     for agent in AGENTS.values():
         if agent.is_shell:
             continue
         found = shutil.which(agent.binary)
         print(f"  {agent.label:<9} {found or 'missing'}")
-    print(f"Notifications: {'on' if notify_default() else 'off'}"
-          f"{'' if shutil.which('notify-send') else ' (notify-send not found)'}")
+    notify = 'on' if notify_default() else 'off'
+    if os.environ.get("AGMUX_NOTIFY_CMD"):
+        notify += " (custom command)"
+    elif not shutil.which("notify-send"):
+        notify += " (notify-send not found)"
+    print(f"Notifications: {notify}")
     print(f"Watch interval: {watch_interval()}s")
     print(f"Resources: {'on' if resources_enabled() else 'off'}"
           f"{'' if _process_table() else ' (ps unavailable)'}")
-    print(f"Sessions: {len(tmux.sessions())}")
-    print(f"Usage data: {'available' if codex_usage(0) else 'none found'}")
+    print(f"ASCII glyphs: {'on' if os.environ.get('AGMUX_ASCII') else 'off'}")
+    limits = codex_usage(0)
+    print(f"Codex usage: {'available' if limits else 'none found'}"
+          f" ({CODEX_HOME / 'sessions'})")
+    opencode = opencode_usage(0)
+    if opencode:
+        print(f"OpenCode usage: {opencode['source']} ({opencode['table']})")
+    elif OPENCODE_DB.is_file():
+        print(f"OpenCode usage: {OPENCODE_DB} (no readable session table)")
+    else:
+        print(f"OpenCode usage: no database at {OPENCODE_DB}")
+    sessions = tmux.session_details(detect=True)
+    statuses = [row_status(row) for row in sessions]
+    print(f"Sessions: {len(sessions)} "
+          f"({statuses.count('blocked')} need input, "
+          f"{statuses.count('finished')} finished)")
 
 
 def watch_command(tmux, interval, once=False, notify_enabled=True):
@@ -2194,7 +2494,14 @@ def build_parser():
     listing = sub.add_parser("list", help="list running tmux sessions")
     listing.add_argument("--json", action="store_true",
                          help="emit one JSON array with CPU and memory per session")
+    listing.add_argument("--no-resources", action="store_true", default=argparse.SUPPRESS,
+                         help="do not sample per-session CPU and memory")
     sub.add_parser("ls", help="alias for list")
+    info = sub.add_parser("info", help="show details for one session")
+    info.add_argument("session")
+    info.add_argument("--json", action="store_true", help="emit one JSON object")
+    info.add_argument("--no-resources", action="store_true", default=argparse.SUPPRESS,
+                      help="do not sample CPU and memory")
     sub.add_parser("names", help="print session names for shell completion")
     attach = sub.add_parser("attach", help="attach outside tmux; switch inside it")
     attach.add_argument("session")
@@ -2205,7 +2512,8 @@ def build_parser():
     new.add_argument("--cwd", default=str(Path.cwd()))
     new.add_argument("--shell", action="store_true", help="alias for --agent shell")
     new.add_argument("--detach", action="store_true", help="create without attaching")
-    new.add_argument("--no-notify", action="store_true", help="no completion notification")
+    new.add_argument("--no-notify", action="store_true", default=argparse.SUPPRESS,
+                     help="no completion notification")
     rename = sub.add_parser("rename", help="rename an existing session")
     rename.add_argument("session")
     rename.add_argument("name")
@@ -2218,12 +2526,16 @@ def build_parser():
     delete.add_argument("--yes", action="store_true",
                         help="skip the typed confirmation for this one session")
     sub.add_parser("kill", help="alias for delete").add_argument("session")
-    sub.add_parser("usage", help="show locally available provider usage limits")
+    usage = sub.add_parser("usage", help="show locally available provider usage limits")
+    usage.add_argument("--json", action="store_true",
+                       help="emit Codex limits and OpenCode session usage as JSON")
     sub.add_parser("agents", help="list known agents and whether they are installed")
     watch = sub.add_parser("watch", help="notify when an agent needs input")
     watch.add_argument("--interval", type=float, default=watch_interval(),
                        help="seconds between checks (default: %(default)s)")
     watch.add_argument("--once", action="store_true", help="check once and exit")
+    watch.add_argument("--no-notify", action="store_true", default=argparse.SUPPRESS,
+                       help="print changes without desktop notifications")
     preview = sub.add_parser("preview", help="show recent output from the active pane")
     preview.add_argument("session")
     peek = sub.add_parser("peek", help="read-only live output viewer without attaching")
@@ -2291,6 +2603,14 @@ def main(argv=None):
             enabled = color_enabled()
             for row in rows:
                 print(list_line(row, enabled))
+    elif args.command == "info":
+        enabled = color_enabled()
+        record = info_record(tmux, args.session, resources=resources)
+        if args.json:
+            print(json.dumps(record))
+        else:
+            for line in info_lines(record, enabled):
+                print(line)
     elif args.command == "names":
         for row in tmux.sessions():
             print(clean(row["name"]))
@@ -2348,9 +2668,13 @@ def main(argv=None):
         tmux.delete(info["id"], expected=info)
         print(paint(f"Deleted session {info['name']}.", "attached", enabled))
     elif args.command == "usage":
-        enabled = color_enabled()
-        for text, role in usage_report(width=24):
-            print(paint(text, role, enabled))
+        if args.json:
+            print(json.dumps(dict(codex=codex_usage(0), opencode=opencode_usage(0)),
+                             sort_keys=True))
+        else:
+            enabled = color_enabled()
+            for text, role in usage_report(width=24):
+                print(paint(text, role, enabled))
     elif args.command == "preview":
         enabled = color_enabled()
         sid = tmux.resolve(args.session)["id"]

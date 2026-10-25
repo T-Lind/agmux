@@ -4,6 +4,50 @@ All notable changes to agmux are documented here. The format is loosely based
 on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [semantic versioning](https://semver.org/).
 
+## [0.6.0]
+
+### Added
+- `agmux info SESSION [--json]`: agent, state, directory, panes, attached
+  client ttys, and CPU/memory for one session.
+- `agmux usage --json` for scripts and dashboards, alongside the existing
+  `list --json`.
+- `agmux list --no-resources` for a list without the process sample.
+- Agent-pane tracking: state detection and prompt notifications keep watching
+  the pane agmux launched even after you switch to another window in the same
+  session.
+- Chrome trimming for Claude Code, Gemini, Aider, Crush, and Goose previews, in
+  addition to Codex and OpenCode.
+- More prompt/working heuristics for Claude/Gemini/Aider forms such as
+  `(Y)es/(N)o`, "Apply this change?", and "Waiting for your approval".
+- A scrollable help panel on short terminals, an `Other directory` option in
+  the new-session wizard, compact headers on narrow terminals, and client
+  counts when more than one terminal is attached.
+- `agmux doctor` now reports the tmux socket/version and popup support, Python
+  and config file details, actually readable Codex/OpenCode usage sources,
+  ASCII mode, and how many sessions need input or have finished.
+
+### Changed
+- OpenCode usage tolerates both `session` and `session_v2` schemas, includes
+  reasoning/cache tokens when recorded, normalizes second/millisecond
+  timestamps, and shows session age.
+- CPU/memory sampling falls back to the BSD/macOS `ps -A -o` form and builds
+  the process tree once per refresh.
+- `humanize_tokens` keeps one decimal below 10K, `money` prints `$0` for zero,
+  and the home directory is shown as `~`.
+
+### Fixed
+- Attaching to a finished agent now clears the `✓` badge (`mark_read` moves the
+  recorded state from finished to idle) instead of leaving it forever.
+- The blocked-prompt watcher now re-notifies when the same prompt appears again
+  after the agent resumes; previously it remembered the prompt too long.
+- State reads capture the end of the pane history, so a pane left scrolled in
+  copy mode cannot hide a current prompt.
+- Attaching no longer turns an exited agent into a perpetual "running" row.
+- Global `--no-notify` before `new`/`watch`, and `--no-resources` after `list`,
+  are parsed correctly.
+- `install.sh --uninstall` also removes the installed man page, and a
+  non-writable man directory no longer aborts the rest of the install.
+
 ## [0.5.1]
 
 ### Changed
@@ -46,5 +90,6 @@ on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 ## [0.2.0]
 - Agent-aware tmux session manager.
 
+[0.6.0]: https://github.com/T-Lind/agmux/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/T-Lind/agmux/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/T-Lind/agmux/compare/v0.4.0...v0.5.0

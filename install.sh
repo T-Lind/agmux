@@ -73,10 +73,12 @@ write_block() {
 
 if [ "$uninstall" = 1 ]; then
     rm -f "$bindir/agmux" "$bindir/cx"
+    mandir="$(dirname "$bindir")/share/man/man1"
+    rm -f "$mandir/agmux.1"
     strip_block "$HOME/.bashrc"
     strip_block "$HOME/.tmux.conf"
-    echo "Removed $bindir/agmux and $bindir/cx, and the agmux blocks from"
-    echo "~/.bashrc and ~/.tmux.conf. Your tmux sessions are untouched."
+    echo "Removed $bindir/agmux and $bindir/cx, the installed man page, and the"
+    echo "agmux blocks from ~/.bashrc and ~/.tmux.conf. Your tmux sessions are untouched."
     exit 0
 fi
 
@@ -92,9 +94,11 @@ echo "Linked $bindir/agmux (and $bindir/cx)"
 # Optional man page, next to the bindir so no root is needed.
 mandir="$(dirname "$bindir")/share/man/man1"
 if [ -f "$here/agmux.1" ]; then
-    mkdir -p "$mandir"
-    cp "$here/agmux.1" "$mandir/agmux.1"
-    echo "Installed man page: $mandir/agmux.1 (try: man agmux)"
+    if mkdir -p "$mandir" 2>/dev/null && cp "$here/agmux.1" "$mandir/agmux.1" 2>/dev/null; then
+        echo "Installed man page: $mandir/agmux.1 (try: man agmux)"
+    else
+        echo "Note: could not install the man page in $mandir (continuing)." >&2
+    fi
 fi
 
 if ! command -v tmux >/dev/null 2>&1; then

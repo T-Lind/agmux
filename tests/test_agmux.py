@@ -101,6 +101,60 @@ class TmuxIntegration(unittest.TestCase):
         self.tmux.mark_read(sid)
         self.assertEqual(self.tmux.resolve(sid)["unread"], 0)
 
+    def test_read_clears_finished_badge_for_an_agent_session(self):
+        sid = self.tmux.create("agent-done", self.root, agent="shell")
+        self.tmux.session_option(sid, "agmux_agent", "codex")
+        self.tmux.session_option(sid, "agmux_status", "finished")
+        self.tmux.session_option(sid, "agmux_unread", "1")
+        self.assertEqual(agmux.row_status(self.tmux.resolve(sid)), "finished")
+        self.tmux.mark_read(sid)
+        row = self.tmux.resolve(sid)
+        self.assertEqual(row["unread"], 0)
+        self.assertEqual(row["status"], "idle")
+        # The agent exited and a login shell is in the pane, so it is idle,
+        # not "running" forever just because the agent label is retained.
+        self.assertEqual(agmux.row_status(row), "idle")
+        # Attaching to a live agent must not clobber its running state.
+        live = self.tmux.create("agent-live", self.root, agent="shell")
+        self.tmux.session_option(live, "agmux_agent", "codex")
+        self.tmux.session_option(live, "agmux_status", "running")
+        self.tmux.mark_read(live)
+        self.assertEqual(self.tmux.resolve(live)["status"], "running")
+
+    def test_pane_lines_are_pinned_to_newest_output_when_scrolled(self):
+        sid = self.tmux.create("state-scrolled", self.root, agent="shell")
+        self.tmux.run("respawn-pane", "-k", "-t", f"{sid}:", "/bin/bash", "-c",
+                      "printf 'old-%03d\\n' $(seq 1 200); echo STATE_NEWEST; sleep 30")
+        pane = self.tmux.run("list-panes", "-s", "-t", sid, "-F", "#{pane_id}")
+        for _ in range(100):
+            if "STATE_NEWEST" in "\n".join(self.tmux.pane_lines(pane, 60)):
+                break
+            time.sleep(0.02)
+        self.tmux.run("copy-mode", "-t", pane)
+        for _ in range(25):
+            self.tmux.run("send-keys", "-t", pane, "-X", "scroll-up")
+        self.assertIn("STATE_NEWEST", "\n".join(self.tmux.pane_lines(pane, 40)))
+
+    def test_tracked_agent_pane_reports_state_after_switching_windows(self):
+        sid = self.tmux.create("agent-window", self.root, agent="shell")
+        agent_pane = self.tmux.run("list-panes", "-s", "-t", sid, "-F", "#{pane_id}")
+        self.tmux.run("respawn-pane", "-k", "-t", agent_pane, "/bin/bash", "-c",
+                      "printf 'Allow command?\\n'; sleep 30")
+        self.tmux.session_option(sid, "agmux_agent", "codex")
+        self.tmux.session_option(sid, "agmux_pane", agent_pane)
+        self.tmux.run("new-window", "-t", sid, "-c", str(self.root), "/bin/sleep", "30")
+        self.tmux.run("select-window", "-t", f"{sid}:1")
+        row = None
+        for _ in range(100):
+            row = next(r for r in self.tmux.session_details(detect=True) if r["id"] == sid)
+            if row["state"] == "blocked":
+                break
+            time.sleep(0.02)
+        self.assertEqual(row["state"], "blocked")
+        self.assertIn("Allow command?", row["prompt"])
+        # The preview still follows the active (shell) window.
+        self.assertEqual(row["process"], "sleep")
+
     def test_cancel_modes_clears_copy_mode(self):
         sid = self.tmux.create("moded", self.root, agent="shell")
         pane = self.tmux.run("list-panes", "-s", "-t", sid, "-F", "#{pane_id}")
@@ -418,6 +472,48 @@ class TmuxIntegration(unittest.TestCase):
         self.assertIn("rss", row)
         self.assertIn("cpu", row)
         self.assertEqual(row["agent"], "shell")
+        self.assertIn("clients", row)
+        self.assertIn("unread", row)
+
+    def test_list_can_skip_resources(self):
+        self.tmux.create("no-resources", self.root, agent="shell")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(agmux.main(["list", "--json", "--no-resources"]), 0)
+        row = next(record for record in json.loads(output.getvalue())
+                   if record["name"] == "no-resources")
+        self.assertEqual((row["cpu"], row["rss"]), (0.0, 0))
+
+    def test_info_command_json_and_text(self):
+        sid = self.tmux.create("info-target", self.root, agent="shell")
+        self.tmux.run("new-window", "-d", "-t", sid, "-c", str(self.root), "-n", "second")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(agmux.main(["info", "info-target", "--json"]), 0)
+        record = json.loads(output.getvalue())
+        self.assertEqual(record["name"], "info-target")
+        self.assertEqual(record["status"], "shell")
+        self.assertEqual(record["pane_count"], 2)
+        self.assertEqual(len(record["panes"]), 2)
+        self.assertIn("client_ttys", record)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(agmux.main(["info", "info-target"]), 0)
+        text = output.getvalue()
+        self.assertIn("info-target", text)
+        self.assertIn("windows: 2", text)
+        self.assertIn("window 0", text)
+
+    def test_usage_json_is_machine_readable(self):
+        with patch.object(agmux, "codex_usage",
+                          return_value={"plan_type": "plus", "primary": {"used_percent": 5.0}}), \
+                patch.object(agmux, "opencode_usage", return_value=None):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(agmux.main(["usage", "--json"]), 0)
+        data = json.loads(output.getvalue())
+        self.assertEqual(data["codex"]["plan_type"], "plus")
+        self.assertIsNone(data["opencode"])
 
 
 class AgentMetadata(unittest.TestCase):
@@ -435,6 +531,18 @@ class AgentMetadata(unittest.TestCase):
         self.assertEqual(agmux.row_status({"agent": "codex"}), "running")
         self.assertEqual(agmux.row_status({"agent": "shell"}), "shell")
         self.assertEqual(agmux.row_status({}), "shell")
+        # A tracked agent that exited and left a login shell is idle.
+        self.assertEqual(agmux.row_status({"agent": "codex", "status": "idle"}), "idle")
+        self.assertEqual(agmux.row_status({"agent": "codex", "process": "bash"}), "idle")
+        self.assertEqual(agmux.row_status({"agent": "codex", "process": "node"}), "running")
+
+    def test_short_path_home_and_humanize_tokens(self):
+        self.assertEqual(agmux.short_path(str(Path.home())), "~")
+        self.assertEqual(agmux.short_path(str(Path.home() / "work")), "~/work")
+        self.assertEqual(agmux.humanize_tokens(999), "999")
+        self.assertEqual(agmux.humanize_tokens(1587), "1.6K")
+        self.assertEqual(agmux.humanize_tokens(12345), "12K")
+        self.assertEqual(agmux.humanize_tokens(2_500_000), "2.5M")
 
     def test_default_name_per_agent(self):
         self.assertEqual(agmux.default_name("/x/demo", [], "codex"), "codex-demo")
@@ -507,6 +615,18 @@ class AnsiAndState(unittest.TestCase):
         self.assertEqual(state, "blocked")
         self.assertTrue(prompt)
 
+    def test_classify_screen_harness_prompts(self):
+        for lines in (["Apply this change?"],
+                      ["(Y)es/(N)o [Yes]:"],
+                      ["Waiting for your approval"],
+                      ["Do you want to proceed?", "\u276f 1. Yes", "  2. No"]):
+            state, prompt = agmux.classify_screen(lines)
+            self.assertEqual(state, "blocked", lines)
+            self.assertTrue(prompt)
+        for lines in (["\u23fa Searching... (esc to interrupt)"],
+                      ["Running command (ctrl+c to stop)"]):
+            self.assertEqual(agmux.classify_screen(lines)[0], "working", lines)
+
     def test_row_status_prefers_screen_state(self):
         self.assertEqual(agmux.row_status({"agent": "codex", "state": "blocked"}), "blocked")
         self.assertEqual(agmux.row_status({"agent": "codex", "state": "working"}), "running")
@@ -548,6 +668,28 @@ class AnsiAndState(unittest.TestCase):
         self.assertIn("tool output", joined)
         self.assertNotIn("esc interrupt", joined)
         self.assertNotIn("Build \u00b7", joined)
+
+    def test_trim_chrome_claude_gemini_and_aider(self):
+        claude = ["assistant output", "",
+                  "  \u256d\u2500\u2500\u2500\u2500\u2500\u256e",
+                  "  \u2502 >                         \u2502",
+                  "  \u2570\u2500\u2500\u2500\u2500\u2500\u256f",
+                  "  ? for shortcuts            \u23f5\u23f5 accept edits on"]
+        trimmed = agmux.trim_chrome("claude", claude)
+        self.assertEqual(trimmed, ["assistant output"])
+        gemini = ["gemini output", "",
+                  "  \u256d\u2500\u2500\u2500\u2500\u2500\u256e",
+                  "  \u2502 > Type your message...    \u2502",
+                  "  \u2570\u2500\u2500\u2500\u2500\u2500\u256f",
+                  "  ? for shortcuts          context left: 90%"]
+        self.assertEqual(agmux.trim_chrome("gemini", gemini), ["gemini output"])
+        aider = ["aider output", "",
+                 "Tokens: 1.2k sent, 3.4k received. Cost: $0.01 message, $0.02 session.",
+                 "aider>"]
+        self.assertEqual(agmux.trim_chrome("aider", aider), ["aider output"])
+        # A live-work status line is content, not chrome.
+        working = ["output", "  \u273b Thinking\u2026 (esc to interrupt)", ""]
+        self.assertIn("Thinking", "\n".join(agmux.trim_chrome("claude", working)))
 
     def test_trim_chrome_leaves_shell_alone(self):
         lines = ["$ ls -la", "total 0", "$ echo hi", "", ""]
@@ -629,6 +771,7 @@ class Usage(unittest.TestCase):
                 agmux._OPENCODE_CACHE["at"] = 0.0
                 usage = agmux.opencode_usage()
             agmux._OPENCODE_CACHE["at"] = 0.0
+            self.assertEqual(usage["table"], "session_v2")
             self.assertEqual(usage["latest"]["title"], "Build a thing")
             self.assertEqual(usage["latest"]["tokens"], 282628 + 77822)
             self.assertEqual(usage["latest"]["model"], "opencode-go/deepseek-v4.1-flash")
@@ -639,6 +782,62 @@ class Usage(unittest.TestCase):
             self.assertIn("Build a thing", report)
             self.assertIn("OpenCode", report)
 
+    def test_opencode_usage_old_schema_and_extra_tokens(self):
+        with tempfile.TemporaryDirectory(prefix="agmux-oc-old-") as directory:
+            db = Path(directory) / "opencode.db"
+            connection = sqlite3.connect(db)
+            connection.execute("create table session (id text, title text, cost real, "
+                               "tokens_input integer, tokens_output integer, model text, "
+                               "time_updated integer)")
+            connection.execute(
+                "insert into session values ('s1','Old schema',0.5,1000,200,null,1700000000)")
+            connection.commit()
+            connection.close()
+            with patch.object(agmux, "OPENCODE_DB", db):
+                agmux._OPENCODE_CACHE["at"] = 0.0
+                usage = agmux.opencode_usage()
+            agmux._OPENCODE_CACHE["at"] = 0.0
+            self.assertEqual(usage["table"], "session")
+            self.assertEqual(usage["latest"]["tokens"], 1200)
+            self.assertEqual(usage["latest"]["updated"], 1700000000)
+            report = "\n".join(text for text, _ in
+                               agmux.usage_report(limits=None, opencode=usage))
+            self.assertIn("from session", report)
+
+        with tempfile.TemporaryDirectory(prefix="agmux-oc-tokens-") as directory:
+            db = Path(directory) / "opencode.db"
+            connection = sqlite3.connect(db)
+            connection.execute(
+                "create table session_v2 (title text, cost real, model text, "
+                "time_updated integer, tokens_input integer, tokens_output integer, "
+                "tokens_reasoning integer, tokens_cache_read integer, tokens_cache_write integer)")
+            connection.execute(
+                "insert into session_v2 values ('New schema',0.1,null,1700000000123,"
+                "100,20,30,400,5)")
+            connection.commit()
+            connection.close()
+            with patch.object(agmux, "OPENCODE_DB", db):
+                agmux._OPENCODE_CACHE["at"] = 0.0
+                usage = agmux.opencode_usage()
+            agmux._OPENCODE_CACHE["at"] = 0.0
+            self.assertEqual(usage["latest"]["tokens"], 555)
+            self.assertEqual(usage["latest"]["reasoning"], 30)
+            self.assertEqual(usage["latest"]["cache_read"], 400)
+            self.assertEqual(usage["latest"]["updated"], 1700000000)
+
+    def test_codex_usage_accepts_top_level_rate_limits(self):
+        with tempfile.TemporaryDirectory(prefix="agmux-codex-") as directory:
+            home = Path(directory)
+            day = home / "sessions" / "2026" / "01" / "01"
+            day.mkdir(parents=True)
+            rollout = day / "rollout-2026-01-01T00-00-00-top.jsonl"
+            rollout.write_text(json.dumps({"rate_limits": {
+                "plan_type": "pro",
+                "primary": {"used_percent": 1.0, "window_minutes": 300}}}) + "\n")
+            with patch.object(agmux, "CODEX_HOME", home):
+                limits = agmux.find_codex_rate_limits()
+            self.assertEqual(limits["plan_type"], "pro")
+
     def test_missing_usage_is_graceful(self):
         with tempfile.TemporaryDirectory(prefix="agmux-usage-") as directory:
             with patch.object(agmux, "CODEX_HOME", Path(directory)), \
@@ -648,8 +847,28 @@ class Usage(unittest.TestCase):
                 self.assertEqual(agmux.opencode_inline(None), "")
                 self.assertTrue(agmux.usage_report(limits=None))
 
+    def test_money_formats_zero_and_small_amounts(self):
+        self.assertEqual(agmux.money(0), "$0")
+        self.assertEqual(agmux.money(None), "$0")
+        self.assertEqual(agmux.money(0.0012), "$0.0012")
+        self.assertEqual(agmux.money(0.24), "$0.24")
+
 
 class Notifications(unittest.TestCase):
+    def test_blocked_transition_reenables_the_same_prompt(self):
+        prompt, previous = agmux.blocked_transition(None, "blocked", "Allow command?")
+        self.assertEqual(prompt, "Allow command?")
+        self.assertEqual(previous, "Allow command?")
+        # Still blocked on the same prompt: no duplicate notification.
+        self.assertEqual(agmux.blocked_transition(previous, "blocked", "Allow command?"),
+                         (None, "Allow command?"))
+        # Leaving blocked forgets the prompt...
+        self.assertEqual(agmux.blocked_transition(previous, "working", ""), (None, None))
+        # ...so the same prompt is announced again next time.
+        self.assertEqual(agmux.blocked_transition(None, "blocked", "Allow command?"),
+                         ("Allow command?", "Allow command?"))
+        self.assertEqual(agmux.blocked_transition(None, "working", ""), (None, None))
+
     def test_custom_notify_command_receives_fields(self):
         with tempfile.TemporaryDirectory(prefix="agmux-notify-") as directory:
             output = Path(directory) / "out.txt"
@@ -714,6 +933,24 @@ class Resources(unittest.TestCase):
         self.assertIn("cpu", label)
         self.assertIn("mem", label)
 
+    def test_process_table_falls_back_to_bsd_ps(self):
+        linux = subprocess.CompletedProcess([], 1, "", "illegal option")
+        bsd = subprocess.CompletedProcess([], 0, "10 1 2.5 100\n11 10 1.5 50\n", "")
+        with patch.object(agmux.subprocess, "run", side_effect=[linux, bsd]) as run:
+            agmux._PS_CACHE["at"] = 0.0
+            table = agmux._process_table(max_age=0)
+        self.assertEqual(table[10], (1, 2.5, 100))
+        self.assertEqual(table[11], (10, 1.5, 50))
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("-A", run.call_args_list[1].args[0])
+
+    def test_process_table_empty_when_ps_unavailable(self):
+        failed = subprocess.CompletedProcess([], 1, "", "not found")
+        with patch.object(agmux.subprocess, "run", return_value=failed):
+            agmux._PS_CACHE["at"] = 0.0
+            self.assertEqual(agmux._process_table(max_age=0), {})
+        agmux._PS_CACHE["at"] = 0.0
+
     def test_process_usage_sums_only_the_tree(self):
         table = {
             10: (1, 5.0, 100),
@@ -733,6 +970,16 @@ class Resources(unittest.TestCase):
 
 
 class Config(unittest.TestCase):
+    def test_global_flags_work_before_and_after_subcommands(self):
+        parser = agmux.build_parser()
+        for argv in (["--no-notify", "new", "x"], ["new", "x", "--no-notify"],
+                     ["--no-notify", "watch"], ["watch", "--no-notify"]):
+            self.assertTrue(parser.parse_args(argv).no_notify, argv)
+        for argv in (["--no-resources", "list"], ["list", "--no-resources"],
+                     ["--no-resources", "info", "x"],
+                     ["info", "x", "--no-resources"]):
+            self.assertTrue(parser.parse_args(argv).no_resources, argv)
+
     def test_load_config_sets_unset_variables_only(self):
         with tempfile.TemporaryDirectory(prefix="agmux-config-") as directory:
             path = Path(directory) / "config"
