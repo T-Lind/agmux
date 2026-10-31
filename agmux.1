@@ -1,4 +1,4 @@
-.TH AGMUX 1 "2026" "agmux 0.7.0" "User Commands"
+.TH AGMUX 1 "2026" "agmux 0.7.1" "User Commands"
 .SH NAME
 agmux \- a terminal control panel for tmux and AI coding agents
 .SH SYNOPSIS
@@ -178,6 +178,14 @@ also binds Alt\-s to detach the current client and run the picker directly in
 the same terminal, and Alt\-x to kill the current session after a y/n
 confirmation. Alt\-x stops every program in that session; the picker's Ctrl\-D
 flow is the safer, typed\-name alternative.
+.SH LIVE PREVIEWS
+The main picker recognizes a paused Codex fullscreen chat's Back to bottom
+control and sends Ctrl-End once when selected, preserving the composer draft.
+It follows again on returning from the viewer or refreshing with Ctrl-L, and
+skips sessions viewed by another terminal. Popup navigation may follow its own
+originating client's session. Set AGMUX_FOLLOW_PREVIEW=0 or follow_preview=0
+to disable this. Other agents' navigation keys are not guessed.
+CLI preview, peek, state checks, and the Ctrl-O viewer remain read-only.
 .SH RECOVERY
 Recovery is on by default. A local helper saves workspaces every 15 seconds while
 its tmux server lives. Agmux changes also trigger snapshots. After reboot, saved
@@ -211,6 +219,7 @@ lines; recognized keys are
 .BR blocked_patterns ,
 .BR working_patterns ,
 .BR trim_chrome ,
+.BR follow_preview ,
 .BR resources ,
 .BR ascii ,
 .BR bin ,
@@ -247,6 +256,7 @@ installed command
 .BR AGMUX_BLOCKED_PATTERNS ,
 .BR AGMUX_WORKING_PATTERNS ,
 .BR AGMUX_TRIM_CHROME ,
+.BR AGMUX_FOLLOW_PREVIEW ,
 .BR AGMUX_RESOURCES ,
 .BR AGMUX_ASCII ,
 .BR AGMUX_BIN ,

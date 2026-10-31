@@ -90,6 +90,12 @@ contain anything already printed by the program in that pane; use `Ctrl-P` or
   viewer and restored on exit. No selected text is saved to recovery snapshots.
 - Adding a shell window uses `new-window -d`, so no attached client is moved and
   no input is injected into any existing pane.
+- The main picker's optional preview following recognizes Codex's fullscreen
+  paused-view control and sends only its dedicated Ctrl-End navigation key,
+  once on selection/return/refresh. It requires an identified Codex pane in the
+  alternate screen outside tmux copy-mode and skips other attached readers.
+  Unknown agents and screens without the control receive no keys. Disable with
+  `AGMUX_FOLLOW_PREVIEW=0`. CLI captures and state polling remain read-only.
 - The read-only viewer captures output without attaching a tmux client or
   sending keys to the pane.
 - Entering a session cancels tmux copy-mode on its panes with `send-keys -X

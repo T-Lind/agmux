@@ -9,7 +9,7 @@ terminal.
 ![The agmux picker: sessions with agent state, a live preview, and per-session CPU and memory](docs/screenshot.svg)
 
 ```
-agmux 0.7.0                     5 sessions · 2 running · 1 need input · 1 done
+agmux 0.7.1                     5 sessions · 2 running · 1 need input · 1 done
 Codex · 5h 12% · 7d 34%       OpenCode 392K tok · $0.27        Ctrl-G details
 Search:
 ! ty-review    Codex    2w  needs input  cpu 12% · mem 486M  codex  ~/source/repos/ty     2m
@@ -287,9 +287,25 @@ agmux list --json | jq '.[] | {name, status, cpu, rss}'
 
 ### Previews always show the newest output
 
-The preview and the read-only viewer capture to the *end* of the pane's
-history, so they end on the latest line even when the pane (or the client
-viewing it) has been scrolled up — you always see what the agent is doing now.
+The preview and read-only viewer capture to the *end* of tmux's pane history,
+so tmux scrollback does not leave the preview on old output.
+
+Some agents also keep their own chat scroll position. When you select a paused
+Codex fullscreen chat in the main picker, agmux recognizes its **Back to bottom**
+control and sends the dedicated `Ctrl-End` navigation key once. The preview
+quickly refreshes with the latest output, and any draft stays in the composer.
+This also runs when you return from `Ctrl-O`, show the preview again, or press
+`Ctrl-L`. Sessions being viewed in another terminal are left where that reader
+scrolled; a popup may follow its own originating terminal's session.
+
+This behavior is agent-specific: it currently supports Codex's fullscreen
+**Back to bottom** control, verified against
+[Codex CLI 0.166.0's navigation handler](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/tui/src/transcript_view/input.rs).
+Other agents' keys are not guessed. Set `follow_preview = 0` / `AGMUX_FOLLOW_PREVIEW=0` to disable it.
+`agmux preview`, `peek`, state checks, and the `Ctrl-O` viewer remain read-only
+and show the screen the agent is currently drawing. In particular, `Ctrl-O`
+does not reset the agent's own scroll position while you inspect/copy output.
+
 The agent's input composer and status footer are trimmed so real output fills
 the space, and short output hugs the bottom like a real terminal. Trimming
 understands Codex, OpenCode, Claude Code, Gemini, Aider, Crush, and Goose
@@ -399,7 +415,7 @@ blocked_patterns = \[y/N\]|continue\?
 ```
 
 Recognized keys: `persist`, `state_dir`, `save_interval`, `repos`, `agent`, `tmux_socket`, `notify`, `notify_cmd`,
-`watch_interval`, `blocked_patterns`, `working_patterns`, `trim_chrome`,
+`watch_interval`, `blocked_patterns`, `working_patterns`, `trim_chrome`, `follow_preview`,
 `resources`, `ascii`, `bin`, `codex_home`, `opencode_data_dir`.
 
 ### Using it across machines
@@ -438,6 +454,7 @@ Every setting has an environment variable; all are optional.
 | `AGMUX_WATCH_INTERVAL` | seconds between blocked-prompt checks | `3` |
 | `AGMUX_BLOCKED_PATTERNS` | extra `|`-joined regexes for "needs input" | unset |
 | `AGMUX_WORKING_PATTERNS` | extra `|`-joined regexes for "working" | unset |
+| `AGMUX_FOLLOW_PREVIEW` | `0` disables returning supported paused chats to latest in the main picker | `1` |
 | `AGMUX_TRIM_CHROME` | `0` keeps agent input/footer lines in previews | `1` |
 | `AGMUX_ASCII` | `1` forces ASCII glyphs | unset |
 | `AGMUX_BIN` | path to `agmux` used by the tmux popup | `agmux` |

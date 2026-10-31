@@ -19,7 +19,7 @@ smoke:
 	$(PYTHON) tests/ui_smoke.py
 
 lint:
-	$(PYTHON) -m py_compile agmux.py tests/test_agmux.py tests/ui_smoke.py
+	$(PYTHON) -m py_compile agmux.py tests/test_agmux.py tests/ui_smoke.py tests/fake_chat.py
 	bash -n install.sh completion.bash
 
 man:

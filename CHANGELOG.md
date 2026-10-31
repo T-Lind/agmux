@@ -4,6 +4,19 @@ All notable changes to agmux are documented here. The format is loosely based
 on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [semantic versioning](https://semver.org/).
 
+## [0.7.1]
+
+### Fixed
+- The main picker now returns supported Codex fullscreen chats to their newest
+  output after internal chat scrolling, including on returning from the output
+  viewer. Recognizes the paused-view control and uses Ctrl-End once, preserving
+  the draft; it skips sessions being read in another terminal.
+- `follow_preview` / `AGMUX_FOLLOW_PREVIEW` can disable this behavior. CLI captures,
+  state detection, and the output viewer remain read-only. Other agents' scroll
+  keys are not guessed.
+- Added offline fullscreen-chat regression tests covering the actual navigation
+  bytes, draft preservation, opt-out, shared readers, and picker/viewer transitions.
+
 ## [0.7.0]
 
 ### Added

@@ -473,6 +473,64 @@ class TmuxIntegration(unittest.TestCase):
         self.assertIn("NEWEST_MARKER", "\n".join(preview))
         self.assertNotIn("line-001", "\n".join(preview))
 
+    def start_paused_chat(self):
+        keys = self.root / "chat-keys"
+        sid = self.tmux.create("paused-chat", self.root, agent="shell")
+        pane = self.tmux.run("list-panes", "-s", "-t", sid, "-F", "#{pane_id}")
+        self.tmux.run("respawn-pane", "-k", "-t", pane, agmux.sys.executable,
+                      str(MODULE.parent / "tests/fake_chat.py"), str(keys))
+        self.tmux.session_option(sid, "agmux_agent", "codex")
+        for _ in range(100):
+            if "OLD_CHAT_HISTORY" in "\n".join(self.tmux.pane_lines(pane)):
+                break
+            time.sleep(0.02)
+        self.assertIn("OLD_CHAT_HISTORY", "\n".join(self.tmux.pane_lines(pane)))
+        return sid, pane, keys
+
+    def test_picker_follow_resets_agent_scroll_and_preserves_draft(self):
+        sid, pane, keys = self.start_paused_chat()
+        # Captures alone remain read-only, including captures used by peek/state.
+        self.assertIn("OLD_CHAT_HISTORY", "\n".join(self.tmux.preview(sid)))
+        self.assertEqual(keys.read_bytes(), b"")
+        self.assertTrue(self.tmux.follow_preview(sid))
+        for _ in range(100):
+            screen = "\n".join(self.tmux.pane_lines(pane))
+            if "LIVE_CHAT_MARKER" in screen:
+                break
+            time.sleep(0.02)
+        self.assertIn("LIVE_CHAT_MARKER", screen)
+        self.assertNotIn("OLD_CHAT_HISTORY", screen)
+        self.assertIn("DRAFT_STAYS_UNSUBMITTED", screen)
+        self.assertEqual(keys.read_bytes(), b"\x1b[1;5F")
+        self.assertFalse(self.tmux.follow_preview(sid))
+        self.assertEqual(keys.read_bytes(), b"\x1b[1;5F")
+
+    def test_picker_follow_respects_opt_out_unknown_agent_and_tmux_copy_mode(self):
+        sid, pane, keys = self.start_paused_chat()
+        with patch.dict(os.environ, {"AGMUX_FOLLOW_PREVIEW": "0"}):
+            self.assertFalse(self.tmux.follow_preview(sid))
+        self.tmux.session_option(sid, "agmux_agent", "claude")
+        self.assertFalse(self.tmux.follow_preview(sid))
+        self.tmux.session_option(sid, "agmux_agent", "codex")
+        self.tmux.run("copy-mode", "-t", pane)
+        self.assertFalse(self.tmux.follow_preview(sid))
+        self.assertEqual(keys.read_bytes(), b"")
+        self.assertEqual(self.tmux.run("display-message", "-p", "-t", pane,
+                                       "#{pane_in_mode}"), "1")
+
+    def test_picker_follow_skips_other_attached_readers_but_allows_popup_origin(self):
+        sid, pane, keys = self.start_paused_chat()
+        original = self.tmux.run
+        def with_reader(*args, **kwargs):
+            if args[0] == "list-clients":
+                return "/dev/pts/reader"
+            return original(*args, **kwargs)
+        with patch.object(self.tmux, "run", side_effect=with_reader):
+            self.assertFalse(self.tmux.follow_preview(sid))
+            self.assertFalse(self.tmux.follow_preview(sid, client="/dev/pts/someone-else"))
+            self.assertEqual(keys.read_bytes(), b"")
+            self.assertTrue(self.tmux.follow_preview(sid, client="/dev/pts/reader"))
+
     def test_list_json_records_cpu_memory_and_state(self):
         self.tmux.create("json-row", self.root, agent="shell")
         output = io.StringIO()
@@ -750,6 +808,13 @@ class TmuxIntegration(unittest.TestCase):
 
 
 class AgentMetadata(unittest.TestCase):
+    def test_paused_chat_control_detection_is_specific(self):
+        for line in ("New activity · ↓ Back to bottom · esc", "↓ Bottom", "↓ Back to bottom"):
+            self.assertIsNotNone(agmux._CODEX_PAUSED_VIEW.fullmatch(line))
+        for line in ("I wrote Back to bottom in my draft", "↓", "Select ↓ Bottom to approve",
+                     "› ↓ Bottom", "Search: ↓ Bottom"):
+            self.assertIsNone(agmux._CODEX_PAUSED_VIEW.fullmatch(line))
+
     def test_resume_id_never_uses_last_or_an_option(self):
         self.assertEqual(agmux.explicit_codex_resume(["resume", "--last"]), "")
         self.assertEqual(agmux.explicit_codex_resume(["resume", "--all"]), "")

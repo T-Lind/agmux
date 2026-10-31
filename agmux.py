@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover - sqlite3 is in the standard library
 
 
 APP = "agmux"
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 SELF = Path(__file__).resolve()
 
 
@@ -65,6 +65,7 @@ _CONFIG_KEYS = {
     "blocked_patterns": "AGMUX_BLOCKED_PATTERNS",
     "working_patterns": "AGMUX_WORKING_PATTERNS",
     "trim_chrome": "AGMUX_TRIM_CHROME",
+    "follow_preview": "AGMUX_FOLLOW_PREVIEW",
     "resources": "AGMUX_RESOURCES",
     "ascii": "AGMUX_ASCII",
     "bin": "AGMUX_BIN",
@@ -558,6 +559,16 @@ _BOX_CHARS = set(chr(code) for code in range(0x2500, 0x25A0)) | \
 # TUIs. It is the same every time and hides real output, so previews drop it.
 _CODEX_COMPOSER = re.compile(r"^(?:[\u203a\u276f>]|[\u2502|]\s*[\u203a\u276f>])\s")
 _CODEX_STATUS = re.compile(r"\b(?:xhigh|high|medium|low|minimal)\b\s*\u00b7")
+
+# Codex's fullscreen transcript shows this only while the tail is hidden and
+# no search/selection/modal owns the view. Do not match prose or bare arrows.
+_CODEX_PAUSED_VIEW = re.compile(
+    r"(?:(?:New activity|New) · )?↓ (?:Back to bottom|Bottom)(?: · esc)?")
+
+
+def preview_follow_enabled():
+    return os.environ.get("AGMUX_FOLLOW_PREVIEW", "1") != "0"
+
 
 # Footer text that agents use for their own composer/status chrome. These are
 # deliberately specific UI phrases, not generic words that also occur in real
@@ -1564,6 +1575,40 @@ class Tmux:
         if not pane:
             raise Error("Cannot identify the current tmux session.")
         return self.run("display-message", "-p", "-t", pane, "#{session_id}")
+
+    def follow_preview(self, sid, client=None):
+        """Return a supported paused chat to latest when selected in the picker.
+
+        This is deliberately separate from preview(), peek, and screen/state
+        reads: those stay read-only. Codex's fullscreen transcript owns Ctrl-End
+        when its paused-view control is shown (verified in codex-cli 0.166.0).
+        Never guess another agent's keys or disturb another attached reader.
+        """
+        if not preview_follow_enabled():
+            return False
+        fmt = "\t".join("#{" + key + "}" for key in
+                        ("pane_id", "window_active", "pane_active", "pane_current_command",
+                         "@agmux_agent", "pane_in_mode", "alternate_on"))
+        panes = [line.split("\t") for line in
+                 self.run("list-panes", "-s", "-t", sid, "-F", fmt).splitlines()]
+        active = next((p for p in panes if len(p) == 7 and p[1:3] == ["1", "1"]), None)
+        if not active or active[5:] != ["0", "1"]:
+            return False
+        pane, _, _, command, explicit, _, _ = active
+        agent = detect_agent(command, explicit)
+        # Python is the foreground process group for agmux's own agent runner.
+        binary = Path(command).name
+        if (not agent or agent.key != "codex"
+                or not (binary in ("codex", "python", "python3") or binary.startswith("codex-"))):
+            return False
+        clients = self.run("list-clients", "-t", sid, "-F", "#{client_tty}", optional=True)
+        if any(tty != client for tty in clients.splitlines()):
+            return False
+        screen = self.run("capture-pane", "-p", "-t", pane, "-S", "0", "-E", "-")
+        if not any(_CODEX_PAUSED_VIEW.fullmatch(line.strip()) for line in screen.splitlines()[-24:]):
+            return False
+        self.run("send-keys", "-t", pane, "C-End")
+        return True
 
     def preview(self, sid, height=16, ansi=False):
         fmt = "\t".join("#{" + key + "}" for key in
@@ -2784,7 +2829,8 @@ def new_session_flow(screen, tmux, style, notify=True):
     return dict(id=sid, name=name)
 
 
-def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=True):
+def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=True,
+           origin_client=None):
     style = style or setup_styles()
     screen.keypad(True)
     screen.timeout(200)
@@ -2794,7 +2840,7 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
         pass
     query, selection, selected_id = "", 0, None
     rows, refreshed, message, message_alert = [], 0.0, "", False
-    preview_key, preview_at = None, 0.0
+    preview_key, preview_at, follow_key = None, 0.0, None
     preview_caption, preview_body = "", []
     renderer = AnsiRenderer()
     while True:
@@ -2882,7 +2928,12 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
             put(screen, preview_y - 1, 0, GLYPH["sep"] * (width - 1), style.muted)
             if selected:
                 if selected_id != preview_key or now - preview_at > 2:
+                    followed = False
                     try:
+                        if selected_id != follow_key:
+                            if not selected.get("saved"):
+                                followed = tmux.follow_preview(selected_id, origin_client)
+                            follow_key = selected_id
                         if selected.get("saved"):
                             detail = ("Codex will open its saved conversation history."
                                       if selected["agent"] == "codex" else
@@ -2898,7 +2949,8 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
                         preview_body = [parse_sgr(line) for line in content]
                     except Error as error:
                         preview_caption, preview_body = str(error), []
-                    preview_key, preview_at = selected_id, now
+                    # Repaint promptly after the agent handles the navigation event.
+                    preview_key, preview_at = selected_id, now - 2 if followed else now
                 put(screen, preview_y, 0, preview_caption, style.muted)
                 offset = 1
                 if row_status(selected) == "blocked" and selected.get("prompt"):
@@ -2955,15 +3007,15 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
         elif key == "\x15":
             query, selection, selected_id = "", 0, None
         elif key == "\x0c":
-            refreshed, preview_at = 0, 0
+            refreshed, preview_at, follow_key = 0, 0, None
         elif key == "\x10":
             show_preview = not show_preview
-            preview_at = 0
+            preview_at, follow_key = 0, None
         elif key == "\x07":
             show_usage_panel(screen, style)
         elif key == "\x0f" and selected and not selected.get("saved"):
             viewer(screen, tmux, selected, style)
-            refreshed, preview_at = 0, 0
+            refreshed, preview_at, follow_key = 0, 0, None
         elif key == curses.KEY_F1:
             show_help(screen, style)
         elif key == "\x12" and selected and not selected.get("saved"):
@@ -3023,7 +3075,7 @@ def interactive(tmux, client=None, show_preview=True, notify=True, resources=Tru
         pass
     client = tmux.client(client)
     selected = curses.wrapper(picker, tmux, show_preview=show_preview, notify=notify,
-                              resources=resources)
+                              resources=resources, origin_client=client)
     return tmux.connect(selected["id"], client) if selected else 0
 
 
@@ -3167,6 +3219,7 @@ def doctor(tmux):
         notify += " (notify-send not found)"
     print(f"Notifications: {notify}")
     print(f"Watch interval: {watch_interval()}s")
+    print(f"Preview auto-follow: {'on' if preview_follow_enabled() else 'off'} (supported chats)")
     print(f"Resources: {'on' if resources_enabled() else 'off'}"
           f"{'' if _process_table() else ' (ps unavailable)'}")
     print(f"ASCII glyphs: {'on' if os.environ.get('AGMUX_ASCII') else 'off'}")

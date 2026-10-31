@@ -167,6 +167,38 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         assert tmux('list-clients', '-F', '#{session_name}') == ''
         print('PASS: viewer selects by keyboard/mouse and copies plain text without attaching')
 
+
+        chat_keys = root / 'paused-chat-keys'
+        tmux('new-session', '-d', '-s', 'paused-chat', '-c', directory,
+             sys.executable, str(MODULE.parent / 'tests/fake_chat.py'), str(chat_keys))
+        tmux('set-option', '-t', '=paused-chat:', '@agmux_agent', 'codex')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if 'OLD_CHAT_HISTORY' in tmux('capture-pane', '-p', '-t', '=paused-chat:'):
+                break
+            time.sleep(0.02)
+        master, proc = launch([sys.executable, str(MODULE), 'peek', 'paused-chat'])
+        wait_output(master, b'OLD_CHAT_HISTORY')
+        assert chat_keys.read_bytes() == b'', 'read-only viewer changed the agent viewport'
+        os.write(master, b'\x1b')
+        wait_exit(master, proc)
+        master, proc = launch([sys.executable, str(MODULE)])
+        wait_output(master, b'LIVE_CHAT_MARKER')
+        assert chat_keys.read_bytes() == b'\x1b[1;5F'
+        assert 'DRAFT_STAYS_UNSUBMITTED' in tmux('capture-pane', '-p', '-t', '=paused-chat:')
+        os.write(master, b'\x0f')
+        wait_output(master, b'Read-only output: paused-chat')
+        tmux('send-keys', '-t', '=paused-chat:', 'PPage')
+        wait_output(master, b'OLD_CHAT_HISTORY')
+        os.write(master, b'\x1b')
+        wait_output(master, b'LIVE_CHAT_MARKER')
+        assert chat_keys.read_bytes() == b'\x1b[1;5F\x1b[5~\x1b[1;5F'
+        os.write(master, b'\x1b')
+        wait_exit(master, proc)
+        assert proc.returncode == 0
+        tmux('kill-session', '-t', '=paused-chat:')
+        print('PASS: main preview returns a paused chat to live output; peek stays read-only and draft survives')
+
         master, proc = launch(command + ['attach-session', '-t', '=alpha'])
         wait_clients('alpha')
         other_master, other_proc = launch(command + ['attach-session', '-t', '=alpha'])
