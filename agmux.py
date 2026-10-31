@@ -8,9 +8,14 @@ can find. It never makes network requests and never reads credential files.
 """
 
 import argparse
+import base64
+import contextlib
 import curses
+import fcntl
+import hashlib
 import json
 import locale
+import math
 import os
 from pathlib import Path
 import re
@@ -18,9 +23,11 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
+import unicodedata
 
 try:
     import sqlite3
@@ -29,7 +36,7 @@ except ImportError:  # pragma: no cover - sqlite3 is in the standard library
 
 
 APP = "agmux"
-VERSION = "0.6.4"
+VERSION = "0.7.0"
 SELF = Path(__file__).resolve()
 
 
@@ -45,6 +52,9 @@ def _env(*names, default=None):
 # follow you across machines (via dotfiles) without exporting variables by hand.
 # Environment variables always win over the file, and the file is optional.
 _CONFIG_KEYS = {
+    "persist": "AGMUX_PERSIST",
+    "state_dir": "AGMUX_STATE_DIR",
+    "save_interval": "AGMUX_SAVE_INTERVAL",
     "repos": "AGMUX_REPOS",
     "agent": "AGMUX_AGENT",
     "default_agent": "AGMUX_AGENT",
@@ -1002,6 +1012,214 @@ def resource_label(cpu, rss):
 
 
 # --------------------------------------------------------------------------
+# Workspace recovery
+# --------------------------------------------------------------------------
+
+
+def recovery_enabled():
+    return os.environ.get("AGMUX_PERSIST", "1") != "0"
+
+
+def state_directory():
+    explicit = os.environ.get("AGMUX_STATE_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local/state")) / APP
+
+
+def save_interval():
+    try:
+        value = float(os.environ.get("AGMUX_SAVE_INTERVAL", "15"))
+        return max(2.0, value) if value > 0 and math.isfinite(value) else 0.0
+    except ValueError:
+        return 15.0
+
+
+class WorkspaceStore:
+    """One private, atomically replaced JSON file per tmux socket.
+
+    The lock covers read/merge/write, including observations from concurrent
+    pickers and the background saver. Missing live sessions remain recoverable:
+    an empty or newly started server must never erase the previous workspace.
+    """
+
+    def __init__(self, socket, directory=None):
+        self.socket = socket
+        root = Path(directory) if directory is not None else state_directory()
+        key = hashlib.sha256(socket.encode()).hexdigest()[:20]
+        self.path = root / (key + ".json")
+
+    def read(self):
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (ValueError, UnicodeError) as error:
+            raise Error(f"Cannot read recovery file {self.path}: {error}. "
+                        "Move it aside to start a new snapshot.") from None
+        if (not isinstance(data, dict) or data.get("version") != 1
+                or data.get("socket") != self.socket
+                or not isinstance(data.get("sessions"), dict)):
+            raise Error(f"Unsupported recovery file: {self.path}")
+        for name, record in data["sessions"].items():
+            validate_workspace(name, record)
+        return data["sessions"]
+
+    @contextlib.contextmanager
+    def locked(self):
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(str(self.path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(fd, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield self.read()
+
+    def update(self, change):
+        with self.locked() as records:
+            change(records)
+            data = dict(version=1, socket=self.socket, sessions=records)
+            fd, temporary = tempfile.mkstemp(prefix=".workspace-", dir=str(self.path.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump(data, stream, ensure_ascii=True, indent=2)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.path)
+                # Make the rename durable as well as the contents.
+                directory_fd = os.open(str(self.path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        return records
+
+    def forget(self, name):
+        def remove(records):
+            if name not in records:
+                raise Error(f"No saved session named {clean(name)!r}.")
+            del records[name]
+        self.update(remove)
+
+
+def validate_workspace(name, record):
+    """Validate disk data before it can become tmux arguments."""
+    def invalid():
+        raise Error(f"Invalid saved workspace for {clean(name)!r}.")
+
+    validate_name(name)
+    if (not isinstance(record, dict) or not isinstance(record.get("agent"), str)
+            or record["agent"] not in AGENTS):
+        invalid()
+    for key in ("cwd", "server", "sid", "agent_pane", "resume_id"):
+        if not isinstance(record.get(key), str) or "\0" in record[key]:
+            invalid()
+    arguments = record.get("argv")
+    if (not isinstance(arguments, list)
+            or not all(isinstance(arg, str) and "\0" not in arg for arg in arguments)):
+        invalid()
+    if record["resume_id"] and not re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_-]*", record["resume_id"]):
+        invalid()
+    if (type(record.get("saved_at")) not in (int, float)
+            or not 0 <= record["saved_at"] <= 1e12):
+        invalid()
+    windows = record.get("windows")
+    if not isinstance(windows, list) or not windows or len(windows) > 256:
+        invalid()
+    indices, pane_ids = set(), set()
+    for window in windows:
+        if not isinstance(window, dict):
+            invalid()
+        index = window.get("index")
+        if type(index) is not int or not 0 <= index <= 100000 or index in indices:
+            invalid()
+        indices.add(index)
+        for key in ("name", "layout"):
+            if not isinstance(window.get(key), str) or "\0" in window[key]:
+                invalid()
+        if not re.fullmatch(r"[0-9a-fA-F]{4},[0-9x,{}\[\]]+", window["layout"]):
+            invalid()
+        for key in ("width", "height"):
+            if type(window.get(key)) is not int or not 1 <= window[key] <= 10000:
+                invalid()
+        if not isinstance(window.get("active"), bool) or not isinstance(window.get("zoomed"), bool):
+            invalid()
+        panes = window.get("panes")
+        if not isinstance(panes, list) or not panes or len(panes) > 256:
+            invalid()
+        for pane in panes:
+            if (not isinstance(pane, dict) or not isinstance(pane.get("id"), str)
+                    or pane["id"] in pane_ids or not isinstance(pane.get("cwd"), str)
+                    or "\0" in pane["cwd"] or not isinstance(pane.get("active"), bool)):
+                invalid()
+            pane_ids.add(pane["id"])
+
+
+def explicit_codex_resume(arguments):
+    # Never guess from "last" or from another session in the same directory.
+    if (len(arguments) >= 2 and arguments[0] == "resume"
+            and re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_-]*", arguments[1])):
+        return arguments[1]
+    return ""
+
+
+def recovery_launch(record, fresh=False):
+    if fresh:
+        return record["agent"], record["argv"]
+    if record["agent"] == "codex":
+        return "codex", ["resume"] + ([record["resume_id"]] if record["resume_id"] else [])
+    return "shell", []
+
+
+def saved_rows(tmux, explicit=False):
+    if not explicit and not recovery_enabled():
+        return []
+    live = {row["name"] for row in tmux.sessions()}
+    rows = []
+    for name, record in tmux.workspace_store().read().items():
+        if name not in live:
+            rows.append(dict(id="saved:" + name, name=name, agent=record["agent"],
+                             status="saved", activity=record["saved_at"],
+                             windows=len(record["windows"]), attached=0, cwd=record["cwd"],
+                             saved=True, process="", unread=0, cpu=0, rss=0))
+    return sorted(rows, key=lambda row: (-row["activity"], row["name"]))
+
+
+def workspace_saver(socket, directory, server):
+    """A single local saver per server; exits when that server stops.
+
+    No shell, service installation, network access, or terminal is involved.
+    A separate lifetime lock prevents concurrent invocations spawning savers.
+    """
+    tmux = Tmux(socket)
+    tmux._store = WorkspaceStore(socket, directory)
+    path = tmux.workspace_store().path
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    key = hashlib.sha256(server.encode()).hexdigest()[:12]
+    fd = os.open(str(path) + "." + key + ".saver.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        interval = save_interval()
+        while recovery_enabled() and interval:
+            try:
+                if tmux.server_identity() != server:
+                    break
+                if tmux.run("show-options", "-gqv", "@agmux_persist") == "0":
+                    break
+                tmux.checkpoint()
+            except (Error, OSError):
+                # Preserve the previous snapshot on transient read/write errors.
+                pass
+            time.sleep(interval)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # tmux
 # --------------------------------------------------------------------------
 
@@ -1020,6 +1238,11 @@ class Tmux:
         if not executable:
             raise Error("tmux is not installed.")
         self.command = [executable] + (["-S", socket] if socket else [])
+        self.socket = socket or str(Path(os.environ.get("TMUX_TMPDIR", "/tmp")) /
+                                    f"tmux-{os.getuid()}" / "default")
+        self._store = None
+        self._saver_started = False
+        self.recovery_error = ""
 
     def run(self, *args, optional=False):
         try:
@@ -1029,11 +1252,195 @@ class Tmux:
             raise Error("tmux did not respond within five seconds.") from None
         if result.returncode:
             missing = ("no server running", "no sessions", "no such file or directory",
-                       "connection refused")
+                       "connection refused", "server exited unexpectedly")
             if optional and any(s in result.stderr.lower() for s in missing):
                 return ""
             raise Error(result.stderr.strip() or "tmux command failed")
         return result.stdout.rstrip("\n")
+
+    def workspace_store(self):
+        if self._store is None:
+            actual = self.run("-N", "display-message", "-p", "#{socket_path}", optional=True)
+            self.socket = actual or self.socket
+            self._store = WorkspaceStore(self.socket)
+        return self._store
+
+    def server_identity(self):
+        return self.run("-N", "display-message", "-p", "#{pid}:#{start_time}", optional=True)
+
+    def checkpoint(self):
+        """Merge live topology into disk state without forgetting closed sessions."""
+        def collect(records):
+            server = self.server_identity()
+            if not server:
+                return
+            rows = self.sessions()
+            metadata = {}
+            fmt = "#{session_id}\t#{@agmux_argv}\t#{@agmux_resume_id}\t#{@agmux_launch_cwd}"
+            for line in self.run("list-sessions", "-F", fmt, optional=True).splitlines():
+                fields = line.split("\t", 3)
+                if len(fields) == 4:
+                    metadata[fields[0]] = fields[1:]
+            fields = ("session_id", "window_index", "window_name", "window_layout",
+                      "window_width", "window_height", "window_active", "window_zoomed_flag",
+                      "pane_id", "pane_current_path", "pane_active")
+            fmt = "\t".join("#{" + field + "}" for field in fields)
+            windows = {}
+            for line in self.run("list-panes", "-a", "-F", fmt, optional=True).splitlines():
+                values = line.split("\t")
+                if len(values) != len(fields):
+                    raise Error("Cannot save workspace: unsupported control characters in tmux metadata.")
+                sid, index, name, layout, width, height, active, zoomed, pane, cwd, focus = values
+                group = windows.setdefault(sid, {})
+                window = group.setdefault(int(index), dict(
+                    index=int(index), name=name, layout=layout, width=int(width), height=int(height),
+                    active=active == "1", zoomed=zoomed == "1", panes=[]))
+                window["panes"].append(dict(id=pane, cwd=cwd, active=focus == "1"))
+            for row in rows:
+                topology = sorted(windows.get(row["id"], {}).values(), key=lambda w: w["index"])
+                if not topology:
+                    continue
+                # tmux may have changed between queries. Never save an incomplete session.
+                if len(topology) != row["windows"]:
+                    continue
+                raw, resume_id, launch_cwd = metadata.get(row["id"], ("[]", "", ""))
+                try:
+                    argv = json.loads(raw or "[]")
+                except ValueError:
+                    argv = []
+                cwd = next((p["cwd"] for w in topology if w["active"]
+                            for p in w["panes"] if p["active"]), topology[0]["panes"][0]["cwd"])
+                record = dict(agent=row["agent"] if row["agent"] in AGENTS else "shell",
+                              cwd=(launch_cwd or cwd) if row["agent"] != "shell" else cwd,
+                              argv=argv, resume_id=resume_id,
+                              agent_pane=row.get("agent_pane") or "", windows=topology,
+                              sid=row["id"], server=server, saved_at=time.time())
+                try:
+                    validate_workspace(row["name"], record)
+                except Error:
+                    continue  # externally created names/paths may not be representable
+                # A rename should move the definition, not leave a phantom saved row.
+                for old in list(records):
+                    previous = records[old]
+                    if (old != row["name"] and previous["server"] == server
+                            and previous["sid"] == row["id"]):
+                        del records[old]
+                records[row["name"]] = record
+        return self.workspace_store().update(collect)
+
+    def autosave(self):
+        try:
+            if not recovery_enabled() or not save_interval():
+                if self.server_identity():
+                    self.run("set-option", "-g", "@agmux_persist", "0")
+                if not recovery_enabled():
+                    return
+            self.checkpoint()
+            self.start_saver()
+            self.recovery_error = ""
+        except (Error, OSError) as error:
+            self.recovery_error = f"Workspace recovery unavailable: {clean(error)}"
+
+    def start_saver(self):
+        if self._saver_started or not save_interval():
+            return
+        server = self.server_identity()
+        if not server or not self.sessions():
+            return
+        store = self.workspace_store()
+        self.run("set-option", "-g", "@agmux_persist", "1")
+        # Do not rely on the server's inherited environment or on shell quoting.
+        worker = subprocess.Popen([sys.executable, str(SELF), "_save-loop", "--socket", self.socket,
+                          "--state-dir", str(store.path.parent), "--server", server],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        threading.Thread(target=worker.wait, daemon=True).start()
+        self._saver_started = True
+
+    def restore(self, name, fresh=False, notify=True):
+        if any(row["name"] == name for row in self.sessions()):
+            raise Error(f"Session {clean(name)!r} is already running.")
+        store = self.workspace_store()
+        restored = []
+
+        def rebuild(records):
+            if name not in records:
+                raise Error(f"No saved session named {clean(name)!r}.")
+            record = records[name]
+            validate_workspace(name, record)
+            for window in record["windows"]:
+                for pane in window["panes"]:
+                    if not Path(pane["cwd"]).is_dir():
+                        raise Error(f"Saved directory does not exist: {clean(pane['cwd'])}")
+            agent, arguments = recovery_launch(record, fresh)
+            profile = AGENTS[agent]
+            if not profile.is_shell and not shutil.which(profile.binary):
+                raise Error(f"{profile.binary} is not on PATH. The saved workspace was kept.")
+            if not profile.is_shell and not Path(record["cwd"]).is_dir():
+                raise Error(f"Saved agent directory does not exist: {clean(record['cwd'])}")
+            shell = os.environ.get("SHELL", "/bin/bash")
+            if not Path(shell).is_file() or not os.access(shell, os.X_OK):
+                shell = "/bin/bash"
+            first = record["windows"][0]
+            # Allow enough temporary room for every split before applying saved layouts.
+            width = max(200, first["width"])
+            height = max(80, max(len(w["panes"]) * 3 for w in record["windows"]))
+            created = self.run("new-session", "-d", "-s", name, "-n", first["name"],
+                               "-c", first["panes"][0]["cwd"], "-x", str(width), "-y", str(height),
+                               "-P", "-F", "#{session_id}\t#{pane_id}\t#{window_index}",
+                               shell, "-l")
+            sid, first_pane, initial_index = created.split("\t")
+            try:
+                if int(initial_index) != first["index"]:
+                    self.run("move-window", "-s", first_pane, "-t", f"{sid}:{first['index']}")
+                panes = {}
+                active_window = f"{sid}:{first['index']}"
+                for index, window in enumerate(record["windows"]):
+                    if index == 0:
+                        pane = first_pane
+                    else:
+                        pane = self.run("new-window", "-d", "-t", f"{sid}:{window['index']}",
+                                        "-n", window["name"], "-c", window["panes"][0]["cwd"],
+                                        "-P", "-F", "#{pane_id}", shell, "-l")
+                    target = f"{sid}:{window['index']}"
+                    panes[window["panes"][0]["id"]] = pane
+                    for saved in window["panes"][1:]:
+                        new_pane = self.run("split-window", "-d", "-t", pane, "-l", "1",
+                                            "-c", saved["cwd"], "-P", "-F", "#{pane_id}",
+                                            shell, "-l")
+                        panes[saved["id"]] = new_pane
+                    self.run("select-layout", "-t", target, window["layout"])
+                    focused = next((p for p in window["panes"] if p["active"]), window["panes"][0])
+                    self.run("select-pane", "-t", panes[focused["id"]])
+                    if window["zoomed"]:
+                        self.run("resize-pane", "-Z", "-t", panes[focused["id"]])
+                    if window["active"]:
+                        active_window = target
+                self.run("select-window", "-t", active_window)
+                tracked = panes.get(record["agent_pane"], first_pane)
+                self.session_option(sid, "agmux_agent", record["agent"])
+                self.session_option(sid, "agmux_status", "shell" if profile.is_shell else "running")
+                self.session_option(sid, "agmux_pane", tracked)
+                self.session_option(sid, "agmux_argv", json.dumps(record["argv"]))
+                self.session_option(sid, "agmux_resume_id", record["resume_id"])
+                self.session_option(sid, "agmux_launch_cwd", record["cwd"])
+                if not profile.is_shell:
+                    self.run("respawn-pane", "-k", "-t", tracked, "-c", record["cwd"],
+                             sys.executable, str(SELF), "_launch", "--agent", agent,
+                             "--bin", shutil.which(profile.binary), "--shell", shell,
+                             "--session", name, "--notify" if notify else "--no-notify",
+                             "--argv", json.dumps(arguments))
+                restored.append(sid)
+            except BaseException:
+                try:
+                    self.run("kill-session", "-t", sid, optional=True)
+                except Error:
+                    pass
+                raise
+        with store.locked() as records:
+            rebuild(records)
+        self.autosave()
+        return restored[0]
 
     def sessions(self):
         fmt = "\t".join("#{" + key + "}" for key in _SESSION_FIELDS)
@@ -1253,13 +1660,20 @@ class Tmux:
             self.session_option(sid, "agmux_agent", profile.key)
             self.session_option(sid, "agmux_status", "shell" if profile.is_shell else "running")
             self.session_option(sid, "agmux_started", str(int(time.time())))
+            self.session_option(sid, "agmux_argv", json.dumps(list(agent_args)))
+            self.session_option(sid, "agmux_launch_cwd", str(directory))
+            resume_id = explicit_codex_resume(agent_args) if agent == "codex" else ""
+            if resume_id:
+                self.session_option(sid, "agmux_resume_id", resume_id)
         except Error:
             pass
+        self.autosave()
         return sid
 
     def rename(self, sid, name):
         validate_name(name)
         self.run("rename-session", "-t", sid, name)
+        self.autosave()
 
     def active_pane(self, sid):
         """Command and working directory of a session's current pane."""
@@ -1302,6 +1716,7 @@ class Tmux:
 
     def delete(self, sid, expected=None):
         """Revalidate immediately, then kill exactly one resolved session."""
+        self.autosave()
         info = self.describe(sid)
         if expected is not None and session_fingerprint(info) != session_fingerprint(expected):
             raise Error(
@@ -1325,7 +1740,9 @@ class Tmux:
             validate_window_name(name)
             args += ["-n", name]
         args += ["-P", "-F", "#{window_index}"]
-        return self.run(*args)
+        index = self.run(*args)
+        self.autosave()
+        return index
 
 
 def session_fingerprint(info):
@@ -1423,6 +1840,8 @@ def row_status(row):
     prompt rather than working. A tracked agent whose process has exited and
     left a login shell behind is idle rather than perennially running.
     """
+    if row.get("saved"):
+        return "saved"
     if row.get("unread"):
         return "finished"
     status = row.get("status")
@@ -1447,7 +1866,7 @@ def row_status(row):
     return "shell"
 
 
-_STATUS_ORDER = {"blocked": 0, "finished": 1, "running": 2, "idle": 3, "shell": 4}
+_STATUS_ORDER = {"blocked": 0, "finished": 1, "running": 2, "idle": 3, "shell": 4, "saved": 5}
 
 
 def state_priority(row):
@@ -1590,6 +2009,18 @@ def launch_agent(agent_key, executable, shell, session, arguments, notify_enable
         print(f"{APP}: {clean(error)}", file=sys.stderr)
         code = 127
     stop_event.set()
+    if tmux and pane and agent_key == "codex":
+        try:
+            output = "\n".join(tmux.pane_lines(pane, 80))
+            # A narrow terminal may wrap the ID: never save a truncated prefix.
+            matches = re.findall(
+                r"To continue this session, run codex resume "
+                r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?![a-zA-Z0-9_-])", output)
+            if matches:
+                set_option("agmux_resume_id", matches[-1])
+        except Error:
+            pass
 
     elapsed = time.time() - started
     set_option("agmux_status", "finished")
@@ -1606,6 +2037,8 @@ def launch_agent(agent_key, executable, shell, session, arguments, notify_enable
                      f"({humanize_delta(elapsed)})", optional=True)
         except Error:
             pass
+    if tmux:
+        tmux.autosave()
     os.execv(shell, [shell, "-l"])
 
 
@@ -1735,16 +2168,117 @@ def prompt(screen, label, initial="", style=None):
     return value
 
 
+# --------------------------------------------------------------------------
+# Read-only text selection and clipboard
+# --------------------------------------------------------------------------
+
+
+def plain_lines(body):
+    return ["".join(text for text, _ in runs) for runs in body]
+
+
+def selected_text(lines, anchor, cursor):
+    """Inclusive character selection, independent of terminal escape styling."""
+    if not lines:
+        return ""
+    start, end = sorted((anchor, cursor))
+    first, last = start[0], end[0]
+    if first == last:
+        return lines[first][start[1]:end[1] + 1]
+    return "\n".join([lines[first][start[1]:]] + lines[first + 1:last]
+                     + [lines[last][:end[1] + 1]])
+
+
+def text_cells(value):
+    return sum(0 if unicodedata.combining(char) else
+               2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+               for char in value)
+
+
+def column_index(value, column):
+    cells = 0
+    for index, char in enumerate(value):
+        cells += text_cells(char)
+        if cells > column:
+            return index
+    return max(0, len(value) - 1)
+
+
+def copy_text(value, tmux=None):
+    """Copy only after an explicit user action; never invoke a shell."""
+    if not value:
+        raise Error("Select some text first.")
+    commands = []
+    if os.environ.get("WAYLAND_DISPLAY"):
+        commands.append(["wl-copy"])
+    if os.environ.get("DISPLAY"):
+        commands.extend((["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]))
+    if sys.platform == "darwin":
+        commands.append(["pbcopy"])
+    for command in commands:
+        executable = shutil.which(command[0])
+        if not executable:
+            continue
+        try:
+            result = subprocess.run([executable, *command[1:]], input=value, text=True,
+                                    encoding="utf-8", stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=3)
+            if result.returncode == 0:
+                return f"Copied {len(value)} characters ({command[0]})"
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    if tmux is not None and os.environ.get("TMUX"):
+        try:
+            result = subprocess.run(tmux.command + ["load-buffer", "-w", "-"], input=value,
+                                    text=True, encoding="utf-8", stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=3)
+            if result.returncode == 0:
+                return (f"Copied {len(value)} characters to tmux buffer; "
+                        "terminal clipboard if enabled")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    # OSC 52 works over SSH in supporting terminals; base64 cannot inject controls.
+    data = value.encode("utf-8")
+    if len(data) > 100000:
+        raise Error("Selection exceeds the terminal clipboard limit; use wl-copy or xclip.")
+    sequence = b"\033]52;c;" + base64.b64encode(data) + b"\a"
+    if os.environ.get("TMUX"):
+        # tmux passthrough requires allow-passthrough on in the user's tmux config.
+        sequence = b"\033Ptmux;" + sequence.replace(b"\033", b"\033\033") + b"\033\\"
+    sys.stdout.flush()
+    os.write(sys.stdout.fileno(), sequence)
+    return f"Sent {len(value)} characters to terminal clipboard (OSC 52)"
+
+
 def viewer(screen, tmux, row, style=None):
-    """Read tmux's existing output; never attach or forward input to a pane."""
+    """Read and select output; never attach or forward keys to the agent."""
+    previous_mouse = None
+    try:
+        previous_mouse = curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)[1]
+        curses.mouseinterval(0)
+    except curses.error:
+        pass
+    try:
+        return output_viewer(screen, tmux, row, style)
+    finally:
+        if previous_mouse is not None:
+            curses.mousemask(previous_mouse)
+
+
+def output_viewer(screen, tmux, row, style=None):
     style = style or Style()
     renderer = AnsiRenderer()
     offset, refreshed, body, caption = 0, 0.0, [], ""
+    anchor, cursor, dragging = None, None, False
+    message, alert = "", False
     screen.timeout(200)
+    screen.keypad(True)
     while True:
         height, width = screen.getmaxyx()
         now = time.monotonic()
-        if now - refreshed > 2:
+        # Freeze the captured output while selecting so new agent output cannot
+        # move the selected text underneath the cursor.
+        if anchor is None and now - refreshed > 2:
             try:
                 lines = tmux.preview(row["id"], 500, ansi=True)
                 caption = lines[0] if lines else ""
@@ -1753,27 +2287,112 @@ def viewer(screen, tmux, row, style=None):
             except Error as error:
                 caption, body = str(error), []
             refreshed = now
+        text = plain_lines(body)
         visible = max(1, height - 5)
         offset = max(0, min(offset, max(0, len(body) - visible)))
         start = max(0, len(body) - visible - offset)
         block = body[start:start + visible]
         screen.erase()
         put(screen, 0, 0, f"Read-only output: {row['name']}", style.heading)
-        put(screen, 1, 0, "Up/Down/PageUp/PageDown scroll | Home oldest | End live | Esc back",
-            style.help)
+        hint = ("Arrows/hjkl select | Home/End line | g/G oldest/newest | y copy | Esc cancel"
+                if anchor is not None else
+                "Up/Down/PgUp/PgDn scroll | Home oldest | End live | Drag or v select | Esc back")
+        put(screen, 1, 0, hint, style.help)
         put(screen, 2, 0, caption, style.muted)
         top = 3 + max(0, visible - len(block))
         for index, runs in enumerate(block):
-            put_runs(screen, top + index, runs, renderer)
-        put(screen, height - 1, 0, "Live tail" if not offset else f"{offset} lines above live tail",
-            style.muted)
+            y, line = top + index, start + index
+            put_runs(screen, y, runs, renderer)
+            if anchor is not None:
+                begin, end = sorted((anchor, cursor))
+                if begin[0] <= line <= end[0]:
+                    left = begin[1] if line == begin[0] else 0
+                    right = end[1] + 1 if line == end[0] else len(text[line])
+                    fragment = text[line][left:right]
+                    put(screen, y, text_cells(text[line][:left]), fragment or " ",
+                        style.selected | curses.A_REVERSE)
+        footer = message or ("Selection frozen - y copies; Esc returns to live output"
+                             if anchor is not None else
+                             "Live tail" if not offset else f"{offset} lines above live tail")
+        put(screen, height - 1, 0, footer, style.warning if alert else style.muted)
         screen.refresh()
         try:
             key = screen.get_wch()
         except curses.error:
             continue
         if key in ("\x1b", "\x03"):
+            if anchor is not None:
+                anchor, cursor, dragging, message = None, None, False, ""
+                refreshed = 0
+                continue
             return
+        if key == curses.KEY_MOUSE:
+            try:
+                _, x, y, _, buttons = curses.getmouse()
+            except curses.error:
+                continue
+            if buttons & curses.BUTTON4_PRESSED:
+                offset += 3
+                continue
+            if buttons & getattr(curses, "BUTTON5_PRESSED", 0):
+                offset -= 3
+                continue
+            if top <= y < top + len(block):
+                line = start + y - top
+                position = (line, column_index(text[line], x))
+                if buttons & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+                    anchor = cursor = position
+                    dragging, message = bool(buttons & curses.BUTTON1_PRESSED), ""
+                elif anchor is not None and dragging:
+                    cursor = position
+            if buttons & curses.BUTTON1_RELEASED:
+                dragging = False
+            continue
+        if key == "v":
+            if anchor is None and text:
+                line = next((i for i in range(start, min(len(text), start + visible)) if text[i]), start)
+                anchor = cursor = (line, 0)
+            else:
+                anchor, cursor, dragging = None, None, False
+                refreshed = 0
+            message = ""
+            continue
+        if anchor is not None:
+            line, column = cursor
+            if key in ("y", "\x19"):
+                try:
+                    message, alert = copy_text(selected_text(text, anchor, cursor), tmux), False
+                except (Error, OSError) as error:
+                    message, alert = str(error), True
+                continue
+            if key in (curses.KEY_UP, "k"):
+                line -= 1
+            elif key in (curses.KEY_DOWN, "j"):
+                line += 1
+            elif key in (curses.KEY_LEFT, "h"):
+                column -= 1
+            elif key in (curses.KEY_RIGHT, "l"):
+                column += 1
+            elif key == curses.KEY_PPAGE:
+                line -= visible
+            elif key == curses.KEY_NPAGE:
+                line += visible
+            elif key == curses.KEY_HOME:
+                column = 0
+            elif key == curses.KEY_END:
+                column = max(0, len(text[line]) - 1)
+            elif key == "g":
+                line, column = 0, 0
+            elif key == "G":
+                line, column = len(text) - 1, max(0, len(text[-1]) - 1)
+            line = max(0, min(line, len(text) - 1))
+            column = max(0, min(column, max(0, len(text[line]) - 1)))
+            cursor, message = (line, column), ""
+            if line < start:
+                offset = len(body) - visible - line
+            elif line >= start + visible:
+                offset = len(body) - line - 1
+            continue
         if key == curses.KEY_UP:
             offset += 1
         elif key == curses.KEY_DOWN:
@@ -1799,15 +2418,15 @@ HELP_SECTIONS = (
         ("Ctrl-L", "refresh sessions and preview now"),
     )),
     ("Sessions", (
-        ("Enter", "attach, or switch to the selected session"),
+        ("Enter", "attach, or restore a saved workspace and attach"),
         ("Ctrl-N", "start an agent or shell session (short wizard)"),
         ("Ctrl-R", "rename the selected session"),
-        ("Ctrl-D, Delete", "delete the selected session (type its name to confirm)"),
+        ("Ctrl-D, Delete", "delete a live session or forget a saved one (type its name)"),
         ("Ctrl-W", "add a shell window in the session's directory"),
     )),
     ("View", (
         ("Ctrl-P", "show or hide the pane preview"),
-        ("Ctrl-O", "read-only output viewer; keys never reach the pane"),
+        ("Ctrl-O", "read-only output viewer; drag or v selects text, y copies"),
         ("Ctrl-G", "usage limits and session cost, read locally"),
         ("F1", "this help"),
         ("Esc", "leave the picker or panel"),
@@ -1824,11 +2443,17 @@ HELP_SECTIONS = (
         ("agmux list --json", "one JSON array of sessions"),
         ("agmux info NAME --json", "one session's details as JSON"),
         ("agmux usage --json", "local limits and cost as JSON"),
+        ("agmux save", "save all live workspaces now"),
+        ("agmux saved", "list workspaces available for recovery"),
+        ("agmux restore --all", "restore saved workspaces, detached"),
+        ("agmux forget NAME", "remove a saved definition; keep any live session"),
         ("agmux doctor", "tools, usage sources, and tmux integration"),
     )),
     ("What you are seeing", (
         ("", "Sessions whose agent needs input are flagged and sorted first."),
         ("", "Finished sessions get a check mark and a notification."),
+        ("", "Saved sessions survive reboot. Enter restores their windows and panes."),
+        ("", "Codex opens saved history; other agents restore to shells by default."),
         ("", "cpu X% and mem Y are this machine's CPU and RAM for the session's"),
         ("", "processes, not token, context-window, or rate-limit usage."),
         ("", "Deleting ends the session and its programs; files on disk are"),
@@ -2033,6 +2658,8 @@ def draw_row(screen, y, row, selected, style):
         segments.append(("  " + agent.label, agent.accent))
     if status == "blocked":
         segments.append(("  needs input", "warning"))
+    elif status == "saved":
+        segments.append(("  saved - Enter restore", "secondary"))
     segments.append((f"  {row['windows']}w", "muted"))
     if row["attached"]:
         label = "attached" if row["attached"] == 1 else f"{row['attached']} clients"
@@ -2177,6 +2804,12 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
                 rows = tmux.session_details(detect=True, resources=resources)
             except Error as error:
                 rows, message, message_alert = [], str(error), True
+            try:
+                rows += saved_rows(tmux)
+                if tmux.recovery_error:
+                    message, message_alert = tmux.recovery_error, True
+            except (Error, OSError) as error:
+                message, message_alert = str(error), True
             refreshed = now
         ordered = sorted(rows, key=lambda r: (state_priority(r), -r["activity"], r["name"]))
         matches = [row for row in ordered if fuzzy(query, searchable(row))]
@@ -2209,6 +2842,8 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
         if blocked:
             summary += f"{mid}{blocked} need input"
         summary += f"{mid}{finished} done"
+        if statuses.count("saved"):
+            summary += f"{mid}{statuses.count('saved')} saved"
         if len(title) + len(summary) + 2 > width:
             summary = f"{len(rows)} sessions{mid}{running} running"
             if blocked:
@@ -2248,8 +2883,16 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
             if selected:
                 if selected_id != preview_key or now - preview_at > 2:
                     try:
-                        lines = tmux.preview(selected_id, max(1, height - preview_y - 6),
-                                             ansi=True)
+                        if selected.get("saved"):
+                            detail = ("Codex will open its saved conversation history."
+                                      if selected["agent"] == "codex" else
+                                      "Restores shell panes; start the agent when ready.")
+                            lines = ["Saved workspace | " + short_path(selected["cwd"]), "",
+                                     "Enter restores windows, panes, layouts, and directories.", detail,
+                                     "Ctrl-D forgets this saved workspace."]
+                        else:
+                            lines = tmux.preview(selected_id, max(1, height - preview_y - 6),
+                                                 ansi=True)
                         preview_caption = lines[0] if lines else ""
                         content = trim_chrome(selected.get("agent"), lines[2:])
                         preview_body = [parse_sgr(line) for line in content]
@@ -2270,7 +2913,8 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
                 for index, runs in enumerate(visible):
                     put_runs(screen, top + index, runs, renderer)
         footer = (message or f"{len(matches)} of {len(rows)} sessions   "
-                  "Enter attach \u00b7 Ctrl-N new \u00b7 Ctrl-R rename \u00b7 "
+                  + ("Enter restore" if selected and selected.get("saved") else "Enter attach")
+                  + " \u00b7 Ctrl-N new \u00b7 Ctrl-R rename \u00b7 "
                   "Ctrl-D delete \u00b7 F1 help").replace("\u00b7", GLYPH["mid"].strip())
         put(screen, height - 1, 0, footer, style.warning if message_alert else style.muted)
         screen.refresh()
@@ -2281,6 +2925,14 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
         if key in ("\x1b", "\x03"):
             return None
         if key in ("\n", "\r", curses.KEY_ENTER) and selected:
+            if selected.get("saved"):
+                try:
+                    sid = tmux.restore(selected["name"], notify=notify)
+                    return tmux.resolve(sid)
+                except (Error, OSError) as error:
+                    message, message_alert = str(error), True
+                    refreshed = 0
+                    continue
             return selected
         if key in (curses.KEY_DOWN, "\t"):
             selection = (selection + 1) % max(1, len(matches))
@@ -2309,12 +2961,12 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
             preview_at = 0
         elif key == "\x07":
             show_usage_panel(screen, style)
-        elif key == "\x0f" and selected:
+        elif key == "\x0f" and selected and not selected.get("saved"):
             viewer(screen, tmux, selected, style)
             refreshed, preview_at = 0, 0
         elif key == curses.KEY_F1:
             show_help(screen, style)
-        elif key == "\x12" and selected:
+        elif key == "\x12" and selected and not selected.get("saved"):
             name = prompt(screen, "Rename (Ctrl-U clears)", selected["name"], style)
             if name is not None:
                 try:
@@ -2324,6 +2976,13 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
                     message, message_alert = str(error), True
         elif key in ("\x04", curses.KEY_DC) and selected:
             try:
+                if selected.get("saved"):
+                    answer = prompt(screen, "Forget saved workspace (type its name)", "", style)
+                    if answer == selected["name"]:
+                        tmux.workspace_store().forget(selected["name"])
+                        message, message_alert = "Forgot saved workspace", False
+                    refreshed, preview_at = 0, 0
+                    continue
                 info = tmux.describe(selected_id)
                 outcome = confirm_delete(screen, tmux, info, style)
                 if outcome == "deleted":
@@ -2334,7 +2993,7 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
             except Error as error:
                 message, message_alert = str(error), True
             refreshed, preview_at = 0, 0
-        elif key == "\x17" and selected:
+        elif key == "\x17" and selected and not selected.get("saved"):
             try:
                 index = tmux.shell_window(selected_id)
                 message = (f"Added shell window {index} to {selected['name']}. "
@@ -2488,6 +3147,13 @@ def doctor(tmux):
           f"({'present' if config.is_file() else 'not present'})")
     if CONFIG_APPLIED:
         print(f"Config applied: {', '.join(sorted(CONFIG_APPLIED))}")
+    print(f"Workspace recovery: {'on' if recovery_enabled() else 'off'}")
+    print(f"Recovery file: {tmux.workspace_store().path}")
+    print(f"Save interval: {save_interval():g}s (0 disables background saving)")
+    try:
+        print(f"Saved workspaces available: {len(saved_rows(tmux))}")
+    except (Error, OSError) as error:
+        print(f"Recovery error: {clean(error)}")
     print(f"Default agent: {DEFAULT_AGENT}")
     for agent in AGENTS.values():
         if agent.is_shell:
@@ -2565,6 +3231,18 @@ def build_parser():
     listing.add_argument("--no-resources", action="store_true", default=argparse.SUPPRESS,
                          help="do not sample per-session CPU and memory")
     sub.add_parser("ls", help="alias for list")
+    sub.add_parser("save", help="save all live workspaces now")
+    saved = sub.add_parser("saved", help="list saved workspaces available for recovery")
+    saved.add_argument("--json", action="store_true", help="emit saved workspaces as JSON")
+    restore = sub.add_parser("restore", help="restore saved workspaces, detached")
+    restore.add_argument("session", nargs="?")
+    restore.add_argument("--all", action="store_true", help="restore all missing saved workspaces")
+    restore.add_argument("--fresh", action="store_true",
+                         help="replay saved agent launch arguments instead of opening history/shells")
+    restore.add_argument("--no-notify", action="store_true", default=argparse.SUPPRESS)
+    forget = sub.add_parser("forget", help="remove a saved definition without killing a live session")
+    forget.add_argument("session")
+    forget.add_argument("--yes", action="store_true", help="skip typing the saved session name")
     info = sub.add_parser("info", help="show details for one session")
     info.add_argument("session")
     info.add_argument("--json", action="store_true", help="emit one JSON object")
@@ -2616,6 +3294,13 @@ def build_parser():
 
 def main(argv=None):
     args_list = list(sys.argv[1:] if argv is None else argv)
+    if args_list and args_list[0] == "_save-loop":
+        internal = argparse.ArgumentParser(add_help=False)
+        internal.add_argument("--socket", required=True)
+        internal.add_argument("--state-dir", required=True)
+        internal.add_argument("--server", required=True)
+        options = internal.parse_args(args_list[1:])
+        return workspace_saver(options.socket, options.state_dir, options.server)
     if args_list and args_list[0] == "_launch":
         internal = argparse.ArgumentParser(add_help=False)
         internal.add_argument("--agent", required=True)
@@ -2659,6 +3344,52 @@ def main(argv=None):
         raise Error("tmux is not installed.")
     tmux = Tmux()
     resources = resources_enabled() and not args.no_resources
+    if args.command in (None, "pick", "new", "rename", "shell", "delete", "kill", "watch"):
+        tmux.autosave()
+        if tmux.recovery_error and args.command not in (None, "pick"):
+            print(f"{APP}: {tmux.recovery_error}", file=sys.stderr)
+    if args.command == "save":
+        tmux.checkpoint()
+        if recovery_enabled():
+            tmux.start_saver()
+        print(f"Saved {len(tmux.sessions())} live workspace(s) to {tmux.workspace_store().path}")
+        return 0
+    if args.command == "saved":
+        rows = saved_rows(tmux, explicit=True)
+        if args.json:
+            print(json.dumps(rows))
+        else:
+            for row in rows:
+                print(f"{clean(row['name'])}  {row['agent']}  {row['windows']}w  "
+                      f"{clean(short_path(row['cwd']))}  saved {humanize_age(row['activity'])}")
+        return 0
+    if args.command == "forget":
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise Error("Confirmation needs a terminal; pass --yes for this saved session.")
+            answer = input(f"Type {clean(args.session)!r} to forget its saved workspace: ")
+            if answer != args.session:
+                print("Cancelled.")
+                return 0
+        tmux.workspace_store().forget(args.session)
+        print(f"Forgot saved workspace {clean(args.session)}.")
+        return 0
+    if args.command == "restore":
+        if bool(args.session) == args.all:
+            raise Error("Choose one saved session name or --all.")
+        targets = [row["name"] for row in saved_rows(tmux, explicit=True)] if args.all else [args.session]
+        failures = []
+        for target in targets:
+            try:
+                tmux.restore(target, fresh=args.fresh, notify=not args.no_notify)
+                print(f"Restored {clean(target)}. Attach with: {APP} attach {shlex.quote(target)}")
+            except (Error, OSError) as error:
+                failures.append(f"{clean(target)}: {clean(error)}")
+        if failures:
+            raise Error("; ".join(failures))
+        if not targets:
+            print("No saved workspaces need restoring.")
+        return 0
     if args.command in (None, "pick"):
         return interactive(tmux, getattr(args, "client", None),
                            show_preview=not args.no_preview,

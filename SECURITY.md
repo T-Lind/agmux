@@ -3,8 +3,8 @@
 Scope: `agmux.py`, `install.sh`, `completion.bash`, `tmux.conf`, `agmux.1`,
 `Makefile`, and their installed source lines in `~/.bashrc` and `~/.tmux.conf`.
 agmux is one standard-library Python file plus the `tmux` and agent binaries
-already on the machine. There is no vendor, updater, background service, or
-network client.
+already on the machine. There is no vendor, updater, installed background service, or
+network client. Recovery uses a local helper that exits when its tmux server stops.
 
 ## What agmux accesses
 
@@ -32,6 +32,14 @@ network client.
   process arguments and environments are never requested or shown.
 - An optional `key = value` config file at `$AGMUX_CONFIG` or
   `~/.config/agmux/config`, used only to set defaults for the variables below.
+- Private recovery JSON files under `$AGMUX_STATE_DIR` or
+  `${XDG_STATE_HOME:-~/.local/state}/agmux`, containing tmux topology, directories,
+  agent launch arguments (which may include user prompts), and known conversation
+  IDs. Snapshot output never includes pane text or transcripts. Writers lock,
+  fsync, and atomically replace mode-0600 files; new storage directories use 0700.
+- Clipboard tools (`wl-copy`, `xclip`, `xsel`, or `pbcopy`), tmux's paste buffer,
+  or a base64-encoded OSC 52 terminal request, only when the user explicitly
+  copies selected viewer text. No clipboard read or automatic copying occurs.
 - Executable locations on `PATH` for tmux and the agent binaries, and the
   normal shell path.
 - Settings such as `TMUX`, `TMUX_PANE`, `AGMUX_*`, `CX_*`, and `SHELL`.
@@ -71,6 +79,15 @@ contain anything already printed by the program in that pane; use `Ctrl-P` or
   want every deletion to go through agmux. `Alt-s` detaches the current client,
   sets `AGMUX_TMUX_SOCKET` from tmux's socket path, clears `TMUX`/`TMUX_PANE`,
   and replaces the client with the ordinary agmux picker in the same terminal.
+- Recovery recreates missing workspaces in new sessions and refuses live name
+  conflicts. Failure rolls back only the newly created session and preserves
+  the saved definition. It does not replay arbitrary pane commands. Codex uses
+  its resume picker or a known explicit ID; other agents restore to shells.
+  `restore --fresh` explicitly replays saved agent launch arguments.
+- Viewer selection freezes a captured screen; selected text is copied without
+  ANSI styling. Clipboard contents are passed via stdin to literal argv commands,
+  or base64 in a fixed OSC 52 envelope. Viewer mouse tracking is scoped to the
+  viewer and restored on exit. No selected text is saved to recovery snapshots.
 - Adding a shell window uses `new-window -d`, so no attached client is moved and
   no input is injected into any existing pane.
 - The read-only viewer captures output without attaching a tmux client or
@@ -106,7 +123,7 @@ terminal defaults and is never passed through raw escape sequences.
 ## Verification
 
 - Source review: only standard-library imports; no `shell=True`, no shell
-  command launcher, no HTTP or socket client, no production file writes.
+  command launcher, no HTTP or socket client, production file writes limited to private recovery snapshots and locks.
 - Isolated tmux integration tests (`python3 -m unittest discover -s tests`)
   cover literal argument forwarding including `$()`, backticks, quotes,
   newlines, a standalone `;`, and a tmux format string; exact-name selection;

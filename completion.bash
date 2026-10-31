@@ -11,12 +11,24 @@ _agmux_complete() {
         )
     elif (( COMP_CWORD == 1 )); then
         while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
-            compgen -W 'pick list ls info attach new rename shell delete kill usage agents preview peek watch last detach doctor names --no-preview --no-notify --no-resources --version' -- "$current"
+            compgen -W 'pick list ls info attach new rename shell delete kill usage agents preview peek watch last detach doctor names save saved restore forget --no-preview --no-notify --no-resources --version' -- "$current"
         )
     elif (( COMP_CWORD == 2 )) && [[ "$command" == @(attach|rename|shell|delete|kill|preview|peek|info) ]]; then
         while IFS= read -r session; do
             [[ "$session" == "$current"* ]] && COMPREPLY+=("$session")
         done < <(agmux names 2>/dev/null)
+    elif (( COMP_CWORD == 2 )) && [[ "$command" == @(restore|forget) && "$current" != -* ]]; then
+        while IFS= read -r session; do
+            [[ "$session" == "$current"* ]] && COMPREPLY+=("$session")
+        done < <(agmux saved --json 2>/dev/null | python3 -c 'import json,sys; print("\n".join(row["name"] for row in json.load(sys.stdin)))' 2>/dev/null)
+    elif [[ "$command" == restore && "$current" == -* ]]; then
+        while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
+            compgen -W '--all --fresh --no-notify' -- "$current"
+        )
+    elif [[ "$command" == forget && "$current" == -* ]]; then
+        while IFS= read -r word; do COMPREPLY+=("$word"); done < <(compgen -W '--yes' -- "$current")
+    elif [[ "$command" == saved && "$current" == -* ]]; then
+        while IFS= read -r word; do COMPREPLY+=("$word"); done < <(compgen -W '--json' -- "$current")
     elif [[ "$command" == new && "$current" == -* ]]; then
         while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
             compgen -W '--agent --cwd --shell --detach --no-notify --' -- "$current"

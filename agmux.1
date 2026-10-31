@@ -1,4 +1,4 @@
-.TH AGMUX 1 "2026" "agmux 0.6.4" "User Commands"
+.TH AGMUX 1 "2026" "agmux 0.7.0" "User Commands"
 .SH NAME
 agmux \- a terminal control panel for tmux and AI coding agents
 .SH SYNOPSIS
@@ -28,6 +28,25 @@ One line per session with agent, state, directory, and CPU/memory. Add
 for machine\-readable output, or
 .B --no-resources
 to skip the CPU/memory sample.
+.TP
+.B save
+Save all live workspaces to a private snapshot now.
+.TP
+.B saved
+List saved workspaces whose names are not currently live. Supports
+.BR --json .
+.TP
+.B restore [SESSION | --all]
+Recreate missing saved workspaces, detached. Restore windows, panes, layouts,
+zoom, focus, and directories. Codex opens its history picker or a known explicit
+conversation; other agents restore to shells. With
+.B --fresh
+explicitly replay the original agent launch arguments, including any task prompt.
+Failures keep saved definitions, and --all continues with other workspaces.
+.TP
+.B forget SESSION
+Forget a saved definition after typing its name; --yes skips confirmation.
+Does not kill a live session, which will be saved again on the next checkpoint.
 .TP
 .B info SESSION
 Show one session's agent, state, directory, panes, attached clients, and
@@ -75,6 +94,9 @@ Print recent output from the active pane.
 .TP
 .B peek SESSION
 Read\-only live viewer that never attaches a client or forwards input.
+Drag or press v and use arrows/hjkl to select; y copies. Esc cancels selection,
+then Esc leaves. Output freezes during selection. Copy uses local clipboard tools,
+tmux buffers, or OSC 52 in supporting terminals.
 .TP
 .B watch
 Notify when any agent starts waiting for input. Options:
@@ -119,7 +141,7 @@ Start an agent or shell session (short wizard).
 Rename the selected session.
 .TP
 .B Ctrl\-D, Delete
-Delete the selected session; type its name to confirm.
+Delete a live session or forget a saved workspace; type its name to confirm.
 .TP
 .B Ctrl\-W
 Add a shell window in the session's directory.
@@ -129,7 +151,7 @@ Add a shell window in the session's directory.
 Show or hide the pane preview.
 .TP
 .B Ctrl\-O
-Read\-only output viewer; keys never reach the pane.
+Read\-only output viewer; drag or v selects text, y copies.
 .TP
 .B Ctrl\-G
 Usage limits and session cost, read locally.
@@ -156,6 +178,19 @@ also binds Alt\-s to detach the current client and run the picker directly in
 the same terminal, and Alt\-x to kill the current session after a y/n
 confirmation. Alt\-x stops every program in that session; the picker's Ctrl\-D
 flow is the safer, typed\-name alternative.
+.SH RECOVERY
+Recovery is on by default. A local helper saves workspaces every 15 seconds while
+its tmux server lives. Agmux changes also trigger snapshots. After reboot, saved
+rows appear in the picker; Enter restores and attaches. Run agmux save after
+upgrading to capture existing sessions. Closed sessions stay saved until forgotten.
+Processes and terminal scrollback are not checkpointed. Recovery does not launch
+a terminal at OS login.
+.PP
+Files contain paths, launch arguments, and known resume IDs, not transcripts.
+Invalid files are preserved and reported. AGMUX_PERSIST=0 disables automatic
+saving and saved picker rows; explicit recovery commands still work.
+AGMUX_SAVE_INTERVAL=0 disables just the background saver. The next agmux
+invocation applies these settings to an existing saver.
 .SH CONFIGURATION
 Environment variables override the optional config file
 .B ~/.config/agmux/config
@@ -164,6 +199,9 @@ Environment variables override the optional config file
 The file uses simple
 .I key = value
 lines; recognized keys are
+.BR persist ,
+.BR state_dir ,
+.BR save_interval ,
 .BR repos ,
 .BR agent ,
 .BR tmux_socket ,
@@ -188,12 +226,18 @@ Defaults to
 .BR ~/source/repos .
 .SH FILES
 .TP
+.I ~/.local/state/agmux
+private workspace snapshots (or $XDG_STATE_HOME/agmux); override with AGMUX_STATE_DIR
+.TP
 .I ~/.config/agmux/config
 optional settings file
 .TP
 .I ~/.local/bin/agmux
 installed command
 .SH ENVIRONMENT
+.BR AGMUX_PERSIST ,
+.BR AGMUX_STATE_DIR ,
+.BR AGMUX_SAVE_INTERVAL ,
 .BR AGMUX_AGENT ,
 .BR AGMUX_REPOS ,
 .BR AGMUX_TMUX_SOCKET ,

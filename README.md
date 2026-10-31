@@ -9,7 +9,7 @@ terminal.
 ![The agmux picker: sessions with agent state, a live preview, and per-session CPU and memory](docs/screenshot.svg)
 
 ```
-agmux 0.6.4                     5 sessions · 2 running · 1 need input · 1 done
+agmux 0.7.0                     5 sessions · 2 running · 1 need input · 1 done
 Codex · 5h 12% · 7d 34%       OpenCode 392K tok · $0.27        Ctrl-G details
 Search:
 ! ty-review    Codex    2w  needs input  cpu 12% · mem 486M  codex  ~/source/repos/ty     2m
@@ -36,7 +36,7 @@ through your rate limit. `agmux` is a small, auditable layer that answers those
 questions and stays out of the way.
 
 - **One file, no packages.** Standard library only, plus the `tmux` and agent
-  binaries you already have. No pip, no plugins, no daemon, no network.
+  binaries you already have. No pip, no plugins, no installed service, no network.
 - **Agent-aware.** Knows Codex, OpenCode, Claude Code, Gemini, Aider, Crush, and
   Goose, and can launch any of them — or a plain shell — in a tmux session.
 - **Resource use per session.** A labelled `cpu X% · mem Y` figure next to each
@@ -60,6 +60,11 @@ questions and stays out of the way.
 - **Inspect before you act.** `agmux info` shows one session's agent, state,
   panes, clients, directory, CPU, and memory; `list --json` and `usage --json`
   cover the rest without scraping the picker.
+- **Workspaces survive reboot.** Automatically saves session names, windows,
+  panes, layouts, and directories. Saved sessions appear in the picker; Enter
+  restores one. Closed sessions stay available until you forget them.
+- **Copy output.** Open the read-only viewer with `Ctrl-O`, drag or use `v` and
+  arrow keys to select text, then press `y` to copy it to your clipboard.
 - **Portable settings.** An optional config file carries your project roots and
   preferences between machines.
 - **Safe by construction.** No shell command strings, literal argument passing,
@@ -109,13 +114,13 @@ shows the selected session's active pane.
 | type | filter sessions |
 | `Up`/`Down`, `Tab`/`Shift-Tab` | select |
 | `PageUp`/`PageDown`, `Home`/`End` | move through the list |
-| `Enter` | attach / switch to the selected session |
+| `Enter` | attach / switch, or restore a saved workspace |
 | `Ctrl-N` | new session wizard (agent → directory → name) |
 | `Ctrl-G` | usage-limit panel |
 | `Ctrl-R` | rename the selected session |
-| `Ctrl-D` / `Delete` | delete the selected session (typed confirmation) |
+| `Ctrl-D` / `Delete` | delete a live session or forget a saved workspace (typed confirmation) |
 | `Ctrl-W` | add a detached shell window in the session's directory |
-| `Ctrl-O` | read-only output viewer (keys never reach the pane) |
+| `Ctrl-O` | read-only output viewer with text selection and copy |
 | `Ctrl-P` | show/hide the preview |
 | `Ctrl-L` | refresh now · `Ctrl-U` clear search |
 | `F1` | help · `Esc` cancel |
@@ -167,8 +172,78 @@ agmux peek ty-review                    # live read-only viewer
 agmux watch                             # notify when an agent needs input
 agmux last                              # previous session (inside tmux)
 agmux detach
-agmux doctor                            # check tools, usage sources, and integration
+agmux save                              # snapshot all live workspaces now
+agmux saved                             # sessions available for recovery (--json supported)
+agmux restore ty-review                  # recreate one saved workspace, detached
+agmux restore --all                      # recreate all missing saved workspaces
+agmux restore ty-review --fresh          # explicitly replay the original agent launch
+agmux forget ty-review                   # forget a saved definition (typed confirmation)
+agmux doctor                            # check tools, recovery, usage sources, and integration
 ```
+
+### After reboot: workspace recovery
+
+Recovery is enabled by default. Opening agmux or creating a session saves the
+live tmux workspace and starts one small background saver for that tmux server.
+It updates the snapshot every 15 seconds, even when the picker is closed, and
+exits after the server stops. Changes made through agmux (creation, rename,
+adding a shell window, and deletion) also trigger a snapshot immediately.
+Run `agmux save` once after upgrading to capture sessions you already have.
+
+After reboot, open `agmux` as usual. Your missing sessions appear as **saved**;
+select one and press Enter to restore and attach. You can also run
+`agmux restore NAME` or `agmux restore --all` to restore them detached. This
+recreates window names and indices, panes, split layouts, zoom, focus, and each
+pane's directory. It skips live names instead of replacing them when restoring
+all. A missing directory or failed restore keeps the saved definition for retry,
+and restoring all continues with the other sessions.
+
+Running processes and terminal scrollback are not checkpointed. For Codex,
+restoring opens `codex resume` so you can choose the saved conversation. When
+agmux knows an explicit conversation ID from `new ... -- resume ID`, or captures
+Codex's resume instruction at normal exit, it resumes that ID directly. It never
+uses `--last` to guess between conversations. Other agents restore to shell
+panes; start the agent's own resume flow there. `--fresh` explicitly starts the
+saved agent with its original arguments, including any original task prompt.
+
+Closed sessions remain recoverable. `Ctrl-D` on a saved row, or
+`agmux forget NAME`, removes its definition after typed confirmation (`--yes`
+for scripts). Forgetting does not kill a live session; a live session will be
+saved again on the next checkpoint. Renaming moves the saved definition.
+
+Snapshots are stored separately per tmux socket under
+`${XDG_STATE_HOME:-~/.local/state}/agmux`. They use private files (mode `0600`)
+and atomic replacement with a writer lock. They contain workspace paths, agent
+launch arguments, and known resume IDs, not pane output or transcripts. If launch
+arguments contain sensitive text, that text is included in this private file.
+`agmux doctor` reports its path and recovery status. Invalid snapshots are
+reported and preserved instead of silently overwritten.
+
+Set `persist = 0` / `AGMUX_PERSIST=0` to disable automatic saving and saved rows
+in the picker; the next agmux invocation stops an existing saver on its next
+check. Explicit `save`, `saved`, and `restore` commands still work. Set
+`save_interval = 0` to disable just the background saver, keeping snapshots on
+agmux changes. Override the storage directory with `state_dir` / `AGMUX_STATE_DIR`.
+Recovery happens when you use agmux; it does not open a terminal at OS login.
+
+### Select and copy output
+
+Press `Ctrl-O` in the picker, or run `agmux peek NAME`, to open the read-only
+viewer. Drag over output with the mouse, or press `v` to start selection and use
+arrow keys / `hjkl` to extend it. `Home` / `End` select to the beginning/end of
+the line; `PageUp` / `PageDown` move by a screen, and `g` / `G` move to the oldest /
+newest captured line. Press `y` (or `Ctrl-Y`) to copy. Esc cancels the selection;
+Esc again returns to the picker. Output is frozen during selection so new agent
+output cannot change what you copy. The viewer captures up to 500 recent lines.
+
+Copy uses `wl-copy` on Wayland, `xclip` / `xsel` on X11, or `pbcopy` on macOS
+when available. Inside tmux it can copy to tmux's paste buffer and request the
+terminal clipboard (`set-clipboard` must permit it); otherwise it sends an
+OSC 52 clipboard request to supporting terminals, including over SSH. Terminal
+permissions can block that request, so the status reports delivery rather than
+claiming clipboard success. The OSC 52 fallback through tmux requires
+`allow-passthrough on`. Hold Shift while dragging to use your terminal's own
+selection instead of agmux's mouse selection. No viewer keys reach the agent.
 
 ### Agents
 
@@ -323,7 +398,7 @@ resources = 1
 blocked_patterns = \[y/N\]|continue\?
 ```
 
-Recognized keys: `repos`, `agent`, `tmux_socket`, `notify`, `notify_cmd`,
+Recognized keys: `persist`, `state_dir`, `save_interval`, `repos`, `agent`, `tmux_socket`, `notify`, `notify_cmd`,
 `watch_interval`, `blocked_patterns`, `working_patterns`, `trim_chrome`,
 `resources`, `ascii`, `bin`, `codex_home`, `opencode_data_dir`.
 
@@ -350,6 +425,9 @@ Every setting has an environment variable; all are optional.
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
+| `AGMUX_PERSIST` | `0` disables automatic recovery saving and saved picker rows | `1` |
+| `AGMUX_STATE_DIR` | directory for private workspace snapshots | `$XDG_STATE_HOME/agmux` or `~/.local/state/agmux` |
+| `AGMUX_SAVE_INTERVAL` | background checkpoint interval in seconds; `0` disables the background saver | `15` |
 | `AGMUX_AGENT` | default agent for `new` | `codex` |
 | `AGMUX_REPOS` | project roots listed by the new-session wizard (`:`-separated) | `~/source/repos` |
 | `AGMUX_CONFIG` | config file to load | `~/.config/agmux/config` |
@@ -372,7 +450,7 @@ Every setting has an environment variable; all are optional.
 
 agmux is deliberately small so you can read all of it. It uses only the Python
 standard library and local `tmux`/agent binaries; it reads local tmux metadata,
-directory names, one `ps` process listing (pid, parent, CPU%, RSS), the optional
+directory names, private recovery snapshots, one `ps` process listing (pid, parent, CPU%, RSS), the optional
 config file, and Codex/OpenCode usage logs; it makes no network requests and
 reads no credential files. Session names and pane output are filtered for
 control characters before display. Agent arguments are passed as literal argv
@@ -398,9 +476,11 @@ scrolled, tracked agent panes across window switches, multi-root project
 listing, ANSI parsing/rendering, screen classification for Codex/OpenCode/
 Claude/Gemini/Aider prompts, copy-mode cancellation, Codex and OpenCode usage
 parsing (including old OpenCode schemas), notifications, config loading,
-`list`/`info`/`usage` JSON, and `NO_COLOR`/piped output. The smoke test drives
+`list`/`info`/`usage` JSON, workspace recovery after server shutdown, layout/zoom/directory restoration,
+atomic private snapshots, failed/partial recovery, safe resume arguments,
+background saving, text selection and clipboard backends, and `NO_COLOR`/piped output. The smoke test drives
 the picker, viewer, usage panel, new-session wizard, popup switching, and delete
-flow end to end.
+flow end to end, including saved-session recovery and clipboard selection.
 
 ## Compatibility
 

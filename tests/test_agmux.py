@@ -34,6 +34,8 @@ class TmuxIntegration(unittest.TestCase):
                         "Path(os.environ['AGMUX_TEST_ARGV']).write_text(json.dumps(sys.argv[1:]))\n")
         fake.chmod(0o755)
         env = dict(os.environ, AGMUX_TMUX_SOCKET=self.socket, AGMUX_TEST_ARGV=str(self.record),
+                   AGMUX_STATE_DIR=str(self.root / "state"), AGMUX_SAVE_INTERVAL="0",
+                   AGMUX_PERSIST="1",
                    PATH=str(self.bin) + os.pathsep + os.environ["PATH"], SHELL="/bin/bash")
         env.pop("TMUX", None)
         env.pop("TMUX_PANE", None)
@@ -525,8 +527,234 @@ class TmuxIntegration(unittest.TestCase):
         self.assertEqual(data["codex"]["plan_type"], "plus")
         self.assertIsNone(data["opencode"])
 
+    def test_recovery_survives_server_shutdown_with_layout_and_directories(self):
+        directory = self.root / "project with spaces"
+        directory.mkdir()
+        sid = self.tmux.create("reboot work", directory, agent="shell")
+        first = self.tmux.run("list-panes", "-t", sid, "-F", "#{pane_id}")
+        second = self.tmux.run("split-window", "-h", "-t", first, "-c", str(self.root),
+                               "-P", "-F", "#{pane_id}")
+        self.tmux.run("select-pane", "-t", second)
+        self.tmux.run("resize-pane", "-Z", "-t", second)
+        self.tmux.shell_window(sid, self.root, "logs with spaces")
+        self.tmux.checkpoint()
+        before = self.tmux.workspace_store().read()["reboot work"]
+        self.tmux.run("kill-server")
+        self.tmux._store = None
+        # A fresh agmux invocation against an empty server must retain the snapshot.
+        for _ in range(50):
+            if not self.tmux.server_identity():
+                break
+            time.sleep(0.02)
+        self.tmux.checkpoint()
+        self.assertEqual({r["name"] for r in agmux.saved_rows(self.tmux)}, {"seed", "reboot work"})
+        restored = self.tmux.restore("reboot work")
+        after = self.tmux.workspace_store().read()["reboot work"]
+        self.assertEqual(len(after["windows"]), 2)
+        self.assertEqual([len(w["panes"]) for w in after["windows"]], [2, 1])
+        self.assertEqual([w["name"] for w in after["windows"]],
+                         [w["name"] for w in before["windows"]])
+        self.assertEqual([[p["cwd"] for p in w["panes"]] for w in after["windows"]],
+                         [[p["cwd"] for p in w["panes"]] for w in before["windows"]])
+        self.assertTrue(after["windows"][0]["zoomed"])
+        self.assertEqual([w["active"] for w in after["windows"]],
+                         [w["active"] for w in before["windows"]])
+        # The first window had horizontal splits; retain that geometry.
+        self.tmux.run("resize-pane", "-Z", "-t", f"{restored}:0")
+        geometry = self.tmux.run("list-panes", "-t", f"{restored}:0", "-F",
+                                 "#{pane_left}:#{pane_top}").splitlines()
+        self.assertEqual(len(geometry), 2)
+        self.assertNotEqual(geometry[0].split(":")[0], geometry[1].split(":")[0])
+        self.assertEqual(geometry[0].split(":")[1], geometry[1].split(":")[1])
+        self.assertNotIn("reboot work", [r["name"] for r in agmux.saved_rows(self.tmux)])
+
+    def test_recovery_keeps_closed_sessions_and_moves_renamed_definitions(self):
+        sid = self.tmux.create("old", self.root, agent="shell")
+        self.tmux.rename(sid, "new")
+        records = self.tmux.workspace_store().read()
+        self.assertIn("new", records)
+        self.assertNotIn("old", records)
+        self.tmux.delete(sid)
+        self.tmux.checkpoint()
+        self.assertIn("new", [r["name"] for r in agmux.saved_rows(self.tmux)])
+        self.tmux.workspace_store().forget("new")
+        self.tmux.checkpoint()
+        self.assertNotIn("new", self.tmux.workspace_store().read())
+
+    def test_recovery_refuses_conflicts_missing_paths_and_rolls_back_failures(self):
+        directory = self.root / "vanishing"
+        directory.mkdir()
+        sid = self.tmux.create("work", directory, agent="shell")
+        with self.assertRaisesRegex(agmux.Error, "already running"):
+            self.tmux.restore("work")
+        self.tmux.delete(sid)
+        directory.rmdir()
+        with self.assertRaisesRegex(agmux.Error, "directory does not exist"):
+            self.tmux.restore("work")
+        self.assertNotIn("work", [r["name"] for r in self.tmux.sessions()])
+        directory.mkdir()
+        original = self.tmux.run
+        def failing(*args, **kwargs):
+            if args[0] == "select-layout":
+                raise agmux.Error("layout failed")
+            return original(*args, **kwargs)
+        with patch.object(self.tmux, "run", side_effect=failing):
+            with self.assertRaisesRegex(agmux.Error, "layout failed"):
+                self.tmux.restore("work")
+        self.assertNotIn("work", [r["name"] for r in self.tmux.sessions()])
+        self.assertIn("work", self.tmux.workspace_store().read())
+        self.assertEqual(self.tmux.resolve("seed")["name"], "seed")
+
+    def test_recovery_never_replays_prompt_by_default_and_preserves_literal_args(self):
+        sid = self.tmux.create("agent", self.root, agent="codex",
+                               agent_args=["do a task", "$(touch PWNED)", ";"])
+        for _ in range(100):
+            if self.record.exists():
+                break
+            time.sleep(0.02)
+        self.tmux.delete(sid)
+        self.record.unlink()
+        self.tmux.restore("agent")
+        for _ in range(100):
+            if self.record.exists():
+                break
+            time.sleep(0.02)
+        self.assertEqual(json.loads(self.record.read_text()), ["resume"])
+        self.assertFalse((self.root / "PWNED").exists())
+        self.tmux.delete(self.tmux.resolve("agent")["id"])
+        self.record.unlink()
+        self.tmux.restore("agent", fresh=True)
+        for _ in range(100):
+            if self.record.exists():
+                break
+            time.sleep(0.02)
+        self.assertEqual(json.loads(self.record.read_text()), ["do a task", "$(touch PWNED)", ";"])
+
+    def test_recovery_uses_exact_explicit_codex_id(self):
+        sid = self.tmux.create("exact", self.root, agent="codex", agent_args=["resume", "abc-123"])
+        self.tmux.delete(sid)
+        self.tmux.restore("exact")
+        for _ in range(100):
+            if self.record.exists() and json.loads(self.record.read_text()) == ["resume", "abc-123"]:
+                break
+            time.sleep(0.02)
+        self.assertEqual(json.loads(self.record.read_text()), ["resume", "abc-123"])
+        self.assertEqual(self.tmux.workspace_store().read()["exact"]["resume_id"], "abc-123")
+
+    def test_recovery_captures_complete_codex_exit_id_but_not_wrapped_prefix(self):
+        identity = "11111111-2222-3333-4444-555555555555"
+        for name, output, expected in (
+                ("complete", identity, identity),
+                ("wrapped", identity[:18] + "\n" + identity[18:], "")):
+            with self.subTest(name=name):
+                (self.bin / "codex").write_text(
+                    "#!/usr/bin/python3\nprint(" + repr(
+                        "To continue this session, run codex resume " + output) + ")\n")
+                sid = self.tmux.create(name, self.root, agent="codex")
+                for _ in range(100):
+                    row = self.tmux.resolve(sid)
+                    command = self.tmux.run("display-message", "-p", "-t", sid,
+                                            "#{pane_current_command}")
+                    if row["finished"] and command == "bash":
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(row["finished"])
+                self.tmux.checkpoint()
+                self.assertEqual(self.tmux.workspace_store().read()[name]["resume_id"], expected)
+
+    def test_recovery_storage_is_private_atomic_and_separate_per_socket(self):
+        self.tmux.create("private", self.root, agent="shell")
+        store = self.tmux.workspace_store()
+        previous = store.path.read_bytes()
+        self.assertEqual(store.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(store.path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertNotEqual(store.path, agmux.WorkspaceStore(self.socket + "-other").path)
+        with patch.object(agmux.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.tmux.checkpoint()
+        self.assertEqual(store.path.read_bytes(), previous)
+        self.assertEqual(list(store.path.parent.glob(".workspace-*")), [])
+        store.path.write_text("{broken")
+        with self.assertRaisesRegex(agmux.Error, "Cannot read recovery file"):
+            self.tmux.checkpoint()
+        self.assertEqual(store.path.read_text(), "{broken")
+
+    def test_recovery_cli_restore_all_continues_past_missing_directory(self):
+        missing = self.root / "gone"
+        missing.mkdir()
+        one = self.tmux.create("gone", missing, agent="shell")
+        two = self.tmux.create("good", self.root, agent="shell")
+        self.tmux.delete(one)
+        self.tmux.delete(two)
+        missing.rmdir()
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(agmux.Error, "gone"):
+                agmux.main(["restore", "--all"])
+        self.assertEqual(self.tmux.resolve("good")["name"], "good")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(agmux.main(["saved", "--json"]), 0)
+        self.assertEqual([r["name"] for r in json.loads(output.getvalue())], ["gone"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(agmux.main(["forget", "gone", "--yes"]), 0)
+        self.assertEqual(agmux.saved_rows(self.tmux), [])
+
+    def test_recovery_bypasses_custom_default_command_and_keeps_window_indices(self):
+        self.tmux.run("set-option", "-g", "base-index", "1")
+        sid = self.tmux.create("indexed", self.root, agent="shell")
+        self.tmux.shell_window(sid, self.root, "second")
+        self.tmux.run("move-window", "-s", f"{sid}:2", "-t", f"{sid}:7")
+        self.tmux.run("split-window", "-h", "-t", f"{sid}:7", "-c", str(self.root))
+        self.tmux.delete(sid)
+        marker = self.root / "SHOULD_NOT_RUN"
+        self.tmux.run("set-option", "-g", "default-command", "touch " + str(marker))
+        restored = self.tmux.restore("indexed")
+        indices = self.tmux.run("list-windows", "-t", restored, "-F", "#{window_index}")
+        self.assertEqual(indices.splitlines(), ["1", "7"])
+        time.sleep(0.1)
+        self.assertFalse(marker.exists())
+        self.assertEqual(len(self.tmux.describe(restored)["panes"]), 3)
+
+    def test_recovery_can_be_disabled(self):
+        with patch.dict(os.environ, {"AGMUX_PERSIST": "0"}):
+            self.tmux.create("untracked", self.root, agent="shell")
+            self.assertFalse(self.tmux.workspace_store().path.exists())
+            self.assertEqual(agmux.saved_rows(self.tmux), [])
+
+    def test_background_saver_captures_changes_without_picker_and_stops_with_server(self):
+        self.tmux.checkpoint()
+        server = self.tmux.server_identity()
+        args = [agmux.sys.executable, str(MODULE), "_save-loop", "--socket", self.socket,
+                "--state-dir", str(self.root / "state"), "--server", server]
+        env = dict(os.environ, AGMUX_SAVE_INTERVAL="2")
+        worker = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            # Wait until the saver has taken its lifetime lock and first snapshot.
+            time.sleep(0.2)
+            duplicate = subprocess.run(args, env=env, capture_output=True, timeout=3)
+            self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+            self.assertIsNone(worker.poll())
+            self.tmux.run("new-session", "-d", "-s", "outside", "-c", str(self.root))
+            deadline = time.monotonic() + 5
+            while "outside" not in self.tmux.workspace_store().read() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertIn("outside", self.tmux.workspace_store().read())
+            self.tmux.run("kill-server")
+            output, errors = worker.communicate(timeout=4)
+            self.assertEqual(worker.returncode, 0, errors)
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+                worker.communicate(timeout=3)
+
+
 
 class AgentMetadata(unittest.TestCase):
+    def test_resume_id_never_uses_last_or_an_option(self):
+        self.assertEqual(agmux.explicit_codex_resume(["resume", "--last"]), "")
+        self.assertEqual(agmux.explicit_codex_resume(["resume", "--all"]), "")
+        self.assertEqual(agmux.explicit_codex_resume(["resume", "abc-123"]), "abc-123")
+
     def test_detect_agent(self):
         self.assertEqual(agmux.detect_agent("codex").key, "codex")
         self.assertEqual(agmux.detect_agent("/usr/bin/opencode").key, "opencode")
@@ -924,6 +1152,51 @@ class Notifications(unittest.TestCase):
             agmux.launch_agent("codex", "/bin/true", "/bin/bash", "s1", ["--flag"], False)
         execv.assert_called_once_with("/bin/bash", ["/bin/bash", "-l"])
         popen.assert_called_once_with(["/bin/true", "--flag"])
+
+
+class Clipboard(unittest.TestCase):
+    def test_selection_copies_exact_substrings_forward_and_backward_without_ansi(self):
+        lines = agmux.plain_lines([agmux.parse_sgr("\033[31mhello world\033[0m"),
+                                   agmux.parse_sgr("next line")])
+        self.assertEqual(agmux.selected_text(lines, (0, 6), (0, 10)), "world")
+        self.assertEqual(agmux.selected_text(lines, (1, 3), (0, 6)), "world\nnext")
+        self.assertEqual(agmux.selected_text(lines, (0, 6), (1, 3)), "world\nnext")
+        self.assertEqual(agmux.selected_text([], (0, 0), (0, 0)), "")
+        self.assertEqual(agmux.column_index("你ab", 2), 1)
+        self.assertEqual(agmux.text_cells("a你e\u0301"), 4)
+
+    def test_clipboard_uses_literal_stdin_and_falls_back_between_tools(self):
+        contents = "$(touch NEVER)\nquotes ' ; 你好"
+        with patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}), \
+                patch.object(agmux.shutil, "which", side_effect=lambda name: "/bin/" + name), \
+                patch.object(agmux.subprocess, "run", side_effect=[
+                    subprocess.CompletedProcess([], 1), subprocess.CompletedProcess([], 0)]) as run:
+            self.assertIn("xclip", agmux.copy_text(contents))
+        self.assertEqual(run.call_args.args[0], ["/bin/xclip", "-selection", "clipboard"])
+        self.assertEqual(run.call_args.kwargs["input"], contents)
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_clipboard_osc52_is_encoded_and_reports_terminal_delivery(self):
+        contents = "hello\n你好\033]52;bad"
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(agmux.os, "write") as write, \
+                patch.object(agmux.sys, "stdout") as stdout:
+            stdout.fileno.return_value = 9
+            self.assertIn("terminal clipboard", agmux.copy_text(contents))
+        sequence = write.call_args.args[1]
+        self.assertEqual(sequence, b"\033]52;c;" + agmux.base64.b64encode(contents.encode()) + b"\a")
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(agmux.Error, "limit"):
+                agmux.copy_text("x" * 100001)
+
+    def test_clipboard_inside_tmux_uses_its_buffer_without_sending_pane_keys(self):
+        class FakeTmux:
+            command = ["/bin/tmux", "-S", "/tmp/fake.sock"]
+        with patch.dict(os.environ, {"TMUX": "fake"}, clear=True), \
+                patch.object(agmux.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.assertIn("tmux buffer", agmux.copy_text("selected", FakeTmux()))
+        self.assertEqual(run.call_args.args[0][-3:], ["load-buffer", "-w", "-"])
+        self.assertEqual(run.call_args.kwargs["input"], "selected")
 
 
 class Resources(unittest.TestCase):

@@ -4,6 +4,24 @@ All notable changes to agmux are documented here. The format is loosely based
 on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [semantic versioning](https://semver.org/).
 
+## [0.7.0]
+
+### Added
+- Built-in workspace recovery: private, atomic snapshots per tmux socket, saved
+  after agmux changes and every 15 seconds by a helper tied to the live server.
+- Saved sessions appear in the picker after reboot; Enter restores their windows,
+  panes, layouts, zoom, focus, and working directories, then attaches.
+- `save`, `saved [--json]`, `restore NAME|--all [--fresh]`, and `forget NAME [--yes]`.
+  Closed sessions stay recoverable; renamed definitions move with the session.
+- Safe Codex recovery opens its history picker or a known explicit conversation;
+  other agents restore to shells. Original launch arguments are only replayed
+  with `--fresh`.
+- Mouse and keyboard text selection in the read-only viewer (`Ctrl-O` / `peek`):
+  drag or `v` + arrows, then `y` to copy. Output freezes during selection.
+- Clipboard support for Wayland, X11, macOS, tmux buffers, and OSC 52 terminals.
+- Recovery settings (`persist`, `state_dir`, `save_interval`), diagnostics,
+  completion, documentation, and isolated recovery/clipboard regression tests.
+
 ## [0.6.4]
 
 ### Changed

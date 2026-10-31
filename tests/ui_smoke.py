@@ -35,13 +35,19 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
     record = root / 'codex-started'
     fakecodex.write_text('#!/usr/bin/python3\nfrom pathlib import Path\nPath(' + repr(str(record)) + ').write_text("started")\n')
     fakecodex.chmod(0o755)
+    clipboard = root / 'clipboard'
+    fakecopy = fakebin / 'wl-copy'
+    fakecopy.write_text('#!/usr/bin/python3\nimport sys\nfrom pathlib import Path\nPath(' + repr(str(clipboard)) + ').write_text(sys.stdin.read())\n')
+    fakecopy.chmod(0o755)
     # A launcher so the popup binding (which calls `agmux` on PATH) resolves.
     launcher = fakebin / 'agmux'
     launcher.write_text('#!/bin/bash\nexec ' + sys.executable + ' ' + str(MODULE) + ' "$@"\n')
     launcher.chmod(0o755)
     env = dict(os.environ, AGMUX_TMUX_SOCKET=socket, AGMUX_REPOS=str(repositories),
+               AGMUX_STATE_DIR=str(root / 'state'), AGMUX_SAVE_INTERVAL='0', AGMUX_PERSIST='1',
                CODEX_HOME=str(codexhome), OPENCODE_DATA_DIR=str(root / 'ocdata'),
                AGMUX_NOTIFY='0', AGMUX_ASCII='1', AGMUX_CONFIG=os.devnull,
+               WAYLAND_DISPLAY='agmux-test',
                TERM='xterm-256color', PATH=str(fakebin) + os.pathsep + os.environ['PATH'])
     env.pop('TMUX', None)
     env.pop('TMUX_PANE', None)
@@ -73,10 +79,25 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
                 if needle in output:
                     return output
         raise AssertionError(f'Did not find {needle!r}; output tail={output[-1000:]!r}')
+    def wait_exit(master, proc, timeout=5):
+        # Drain the terminal while waiting: a full PTY output buffer can prevent
+        # tmux from processing detach input, especially after large popup redraws.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return proc.returncode
+            if select.select([master], [], [], 0.05)[0]:
+                try:
+                    os.read(master, 65536)
+                except OSError:
+                    pass
+        raise AssertionError('Terminal process did not exit')
     def wait_clients(expected):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            if tmux('list-clients', '-F', '#{session_name}') == expected:
+            result = subprocess.run(command + ['list-clients', '-F', '#{session_name}'],
+                                    env=env, text=True, capture_output=True)
+            if result.returncode == 0 and result.stdout.strip() == expected:
                 return
             time.sleep(0.05)
         raise AssertionError(f'Client did not switch to {expected}')
@@ -104,7 +125,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         os.write(master, b'\r')
         wait_clients('beta renamed')
         os.write(master, b'\x02d')
-        proc.wait(timeout=5)
+        wait_exit(master, proc)
         assert proc.returncode == 0
         print('PASS: interactive filtering, rename, attach, and detach')
 
@@ -116,9 +137,35 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         assert tmux('list-clients', '-F', '#{session_name}') == ''
         assert tmux('capture-pane', '-p', '-t', '=alpha:') == original
         os.write(master, b'\x1b')
-        proc.wait(timeout=5)
+        wait_exit(master, proc)
         assert proc.returncode == 0
         print('PASS: read-only viewer attaches no client and forwards no input')
+
+
+        tmux('new-session', '-d', '-s', 'copy-output', '-c', directory,
+             '/bin/sh', '-c', "printf '\033[31mCOPY_SELECTED_TEXT\033[0m\n'; sleep 60")
+        master, proc = launch([sys.executable, str(MODULE), 'peek', 'copy-output'])
+        wait_output(master, b'COPY_SELECTED_TEXT')
+        os.write(master, b'v')
+        wait_output(master, b'Selection frozen')
+        os.write(master, b'\x1bOFy')  # End selects the line; y copies.
+        wait_output(master, b'Copied 18 characters')
+        assert clipboard.read_text() == 'COPY_SELECTED_TEXT', clipboard.read_text()
+        os.write(master, b'\x1b')
+        wait_output(master, b'Live tail')
+        # Single captured line sits on row 30 in this 32-row terminal.
+        os.write(master, b'\x1b[<0;6;30M')  # mouse press at S in SELECTED
+        wait_output(master, b'Selection frozen')
+        os.write(master, b'\x1b[<32;13;30M\x1b[<0;13;30my')
+        wait_output(master, b'Copied 8 characters')
+        assert clipboard.read_text() == 'SELECTED', clipboard.read_text()
+        os.write(master, b'\x1b')
+        wait_output(master, b'Live tail')
+        os.write(master, b'\x1b')
+        wait_exit(master, proc)
+        assert proc.returncode == 0
+        assert tmux('list-clients', '-F', '#{session_name}') == ''
+        print('PASS: viewer selects by keyboard/mouse and copies plain text without attaching')
 
         master, proc = launch(command + ['attach-session', '-t', '=alpha'])
         wait_clients('alpha')
@@ -144,10 +191,10 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         wait_client(master, 'alpha')
         wait_client(other_master, 'alpha')
         os.write(master, b'\x02d')
-        proc.wait(timeout=5)
+        wait_exit(master, proc)
         assert proc.returncode == 0
         os.write(other_master, b'\x02d')
-        other_proc.wait(timeout=5)
+        wait_exit(other_master, other_proc)
         assert other_proc.returncode == 0
         print('PASS: two-client isolation, popup switching, and last-session navigation')
 
@@ -165,7 +212,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
             time.sleep(0.05)
         assert tmux('list-clients', '-F', '#{session_name}') == '', 'Alt-s did not detach'
         os.write(master, b'\x1b')  # leave the picker; the terminal should finish
-        proc.wait(timeout=5)
+        wait_exit(master, proc)
         assert proc.returncode == 0
         print('PASS: Alt-s detaches and replaces the client with agmux')
 
@@ -186,7 +233,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         os.write(master, b'\x10')  # show preview
         wait_output(master, b'bash  |')
         os.write(master, b'\x1b')
-        proc.wait(timeout=5)
+        wait_exit(master, proc)
         assert proc.returncode == 0
         print('PASS: help, usage panel, preview toggle, and in-picker read-only viewer')
 
@@ -202,7 +249,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         os.write(master, b'\r')
         wait_output(master, b'Enter attach')
         os.write(master, b'\x1b')
-        proc.wait(timeout=5)
+        wait_exit(master, proc)
         assert proc.returncode == 0
         print('PASS: help panel scrolls on a short terminal')
 
@@ -229,7 +276,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
             time.sleep(0.02)
         assert cwd == str(project), (cwd, str(project))
         os.write(master, b'\x02d')
-        proc.wait(timeout=5)
+        wait_exit(master, proc)
         assert proc.returncode == 0
         print('PASS: new-session wizard, fake agent launch, and selected directory')
 
@@ -256,7 +303,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
             time.sleep(0.02)
         assert cwd == str(custom_project), (cwd, str(custom_project))
         os.write(master, b'\x02d')
-        proc.wait(timeout=5)
+        wait_exit(master, proc)
         assert proc.returncode == 0
         print('PASS: new-session wizard custom directory path')
 
@@ -282,14 +329,51 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         sessions = tmux('list-sessions', '-F', '#{session_name}').split()
         assert 'victim' not in sessions and 'bystander' in sessions, sessions
         os.write(master, b'\x1b')
-        proc.wait(timeout=5)
+        wait_exit(master, proc)
         assert proc.returncode == 0
         print('PASS: picker deletion confirmation/cancel and detached shell window')
+
+        # A server restart must leave saved rows in the picker, even with no live sessions.
+        tmux('new-session', '-d', '-s', 'reboot-ui', '-c', str(project))
+        subprocess.run([sys.executable, str(MODULE), 'save'], env=env, check=True,
+                       stdout=subprocess.DEVNULL)
+        tmux('kill-server')
+        time.sleep(0.1)
+        master, proc = launch([sys.executable, str(MODULE)])
+        wait_output(master, b'Enter restore')
+        os.write(master, b'reboot-ui')
+        time.sleep(0.3)
+        os.write(master, b'\r')
+        wait_clients('reboot-ui')
+        assert tmux('display-message', '-p', '-t', '=reboot-ui:', '#{pane_current_path}') == str(project)
+        os.write(master, b'\x02d')
+        wait_exit(master, proc)
+        assert proc.returncode == 0
+        print('PASS: saved workspace appears after server restart and Enter restores/attaches')
+
+        master, proc = launch([sys.executable, str(MODULE)])
+        wait_output(master, b'agmux 0.')
+        os.write(master, b'victim')
+        time.sleep(0.3)
+        os.write(master, b'\x04')
+        wait_output(master, b'Forget saved workspace (type its name)')
+        os.write(master, b'victim\r')
+        wait_output(master, b'Forgot saved workspace')
+        os.write(master, b'\x1b')
+        wait_exit(master, proc)
+        assert proc.returncode == 0
+        output = subprocess.check_output([sys.executable, str(MODULE), 'saved', '--json'], env=env)
+        assert b'"name": "victim"' not in output
+        print('PASS: picker forgets saved workspaces without affecting live sessions')
     finally:
         for proc in processes:
             if proc.poll() is None:
                 proc.terminate()
-                proc.wait(timeout=5)
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
         subprocess.run(command + ['kill-server'], env=env, capture_output=True)
         for master in masters:
             os.close(master)
