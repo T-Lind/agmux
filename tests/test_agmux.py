@@ -954,6 +954,36 @@ class AnsiAndState(unittest.TestCase):
                       ["Running command (ctrl+c to stop)"]):
             self.assertEqual(agmux.classify_screen(lines)[0], "working", lines)
 
+    def test_classify_screen_per_agent_dialogs(self):
+        cases = {
+            "codex": ["  Would you like to run the following command?", "$ rm -rf build",
+                      "› 1. Yes, proceed (y)", "  Press enter to confirm or esc to cancel"],
+            "claude": [" Bash command", "   npm test", " Do you want to proceed?",
+                       " ❯ 1. Yes", "   2. No", " Esc to cancel · Tab to amend"],
+            "opencode": ["△ Permission required", "  Allow once   Always allow   Reject"],
+            "gemini": ["Allow execution of: 'ls'?", "● 1. Allow once",
+                       "  3. No, suggest changes (esc)"],
+            "aider": ["Run shell command? (Y)es/(N)o/(D)on't ask again [Yes]:"],
+            "crush": ["Permission Required", "Allow", "Allow for session", "Deny"],
+            "goose": ["Goose would like to call the above tool, confirm?"],
+        }
+        for agent, lines in cases.items():
+            self.assertEqual(agmux.classify_screen(lines, agent=agent)[0], "blocked", agent)
+        # Codex shows "esc to interrupt" on its question screen; it still needs you.
+        self.assertEqual(agmux.classify_screen(
+            ["Question 1/1", "enter to submit answer | esc to interrupt"], agent="codex")[0],
+            "blocked")
+
+    def test_classify_screen_ignores_prose_questions_above_idle_composer(self):
+        for agent, lines in (
+                ("claude", ["⏺ I can add tests. Should I continue?", "",
+                            "╭" + "─" * 20, "│ > ", "╰" + "─" * 20,
+                            "  ? for shortcuts"]),
+                ("codex", ["• Do you want me to also update the docs?", "",
+                           "› Ask Codex to do anything", "  ? for shortcuts"]),
+                ("opencode", ["Can I help with anything else?", "  ctrl+p commands"])):
+            self.assertEqual(agmux.classify_screen(lines, agent=agent)[0], "idle", agent)
+
     def test_row_status_prefers_screen_state(self):
         self.assertEqual(agmux.row_status({"agent": "codex", "state": "blocked"}), "blocked")
         self.assertEqual(agmux.row_status({"agent": "codex", "state": "working"}), "running")

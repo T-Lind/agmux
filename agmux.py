@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover - sqlite3 is in the standard library
 
 
 APP = "agmux"
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 SELF = Path(__file__).resolve()
 
 
@@ -482,24 +482,73 @@ class AnsiRenderer:
 # Screen-state heuristics. These are intentionally conservative and can be
 # extended without touching the code: AGMUX_BLOCKED_PATTERNS and
 # AGMUX_WORKING_PATTERNS are '|'-joined regular expressions appended here.
-_BLOCKED_PATTERNS = [
+# Strong patterns are specific prompt shapes (y/n tokens, numbered Yes/No
+# options, "press enter to confirm"). Weak patterns are common English that can
+# also appear in an agent's ordinary prose, so they are ignored when an idle
+# composer is drawn below them or when the line is clearly assistant output.
+_BLOCKED_STRONG = [
     r"\[y/n\]", r"\(y/n\)", r"\[Y/n\]", r"\[y/N\]", r"\byes/no\b",
     r"\(y\)es\s*/\s*\(n\)o", r"\[(?:y/n/a|a/y/n|y/n/a)\]",
+    r"\bpress (enter|y)\b[^.]*\b(confirm|continue|approve|allow|deny)",
+    r"\bwaiting for (?:your |user )?(?:input|approval|confirmation|permission)\b",
+    r"^\s*(?:[>❯›●]|\d+[.)])\s*(?:yes|allow|approve|deny|no)\b",
+    r"\b(?:apply|accept|reject)\b[^.?]{0,60}\b(?:change|patch|diff|edit|hunk)s?\?",
+]
+_BLOCKED_WEAK = [
     r"\ballow\b[^.]*\b(run|command|access|edit|write|execute|this|once|always)\b",
     r"\b(approve|approval|permit|permission)\b",
     r"\bwould you like to\b", r"\bdo you want to\b", r"\bare you sure\b",
     r"\bproceed\?", r"\bcontinue\?", r"\boverwrite\?", r"\bconfirm\?",
-    r"\b(?:apply|accept|reject)\b[^.?]{0,60}\b(?:change|patch|diff|edit|hunk)s?\?",
-    r"\bpress (enter|y)\b[^.]*\b(confirm|continue|approve|allow|deny)",
-    r"\bwaiting for (?:your )?(?:input|approval|confirmation|permission)\b",
     r"\bescalat", r"\bneeds? (your )?(input|approval|permission)\b",
-    r"^\s*(?:[>\u276f]|\d+[.)])\s*(?:yes|allow|approve|deny|no)\b",
     r"\b(would|do|does|shall|should|can|could|may)\b[^?]{0,120}\?\s*$",
 ]
+_BLOCKED_PATTERNS = _BLOCKED_STRONG + _BLOCKED_WEAK
+
+# Per-agent dialog fingerprints, taken from each harness's own approval,
+# question, and trust screens. They are checked first and win even over a
+# "esc to interrupt" footer (Codex shows that footer on its question screens).
+_AGENT_BLOCKED = {
+    "codex": [
+        r"would you like to (?:run|make|grant|allow|apply)\b",
+        r"press enter to (?:confirm|continue)", r"enter to submit (?:answer|all)",
+        r"no, and tell codex what to do differently",
+        r"^\s*[›>]?\s*\d+\.\s*yes,? (?:proceed|continue|and don.t ask)",
+        r"allow codex to\b", r"do you trust the (?:contents|files)",
+    ],
+    "claude": [
+        r"do you want to (?:proceed|make this edit|create|overwrite|allow|run|apply)\b",
+        r"would you like to proceed\?", r"do you trust the files",
+        r"^\s*[❯>]?\s*\d+\.\s*yes\b", r"^\s*[❯>]?\s*\d+\.\s*(?:type something|chat about this)",
+        r"esc to cancel\s*[·|-]\s*tab to amend", r"claude needs your permission",
+        r"waiting for (?:permission|user)",
+    ],
+    "opencode": [
+        r"permission required", r"allow once", r"always allow",
+        r"^\s*[┃│|]?\s*reject\s*$", r"enter submit\s+esc dismiss",
+    ],
+    "gemini": [
+        r"allow execution of", r"allow once", r"allow for this session",
+        r"waiting for (?:user )?confirmation", r"apply this change\?",
+        r"^\s*[●>]?\s*\d+\.\s*(?:yes, allow|allow once|modify with)",
+    ],
+    "aider": [
+        r"\((?:y)\)es\s*/\s*\((?:n)\)o", r"\[(?:yes|no)\]:\s*$",
+    ],
+    "crush": [
+        r"permission required", r"allow for session", r"^\s*(?:allow|deny)\s*$",
+    ],
+    "goose": [
+        r"goose would like to call", r"always allow", r"do you allow",
+    ],
+}
+_IDLE_COMPOSER = re.compile(
+    r"^\s*[│┃|]?\s*[›❯>](?!\s*\d+[.)])(?:\s|$)|aider>|\? for shortcuts|"
+    r"ctrl\+p commands|ask codex|type your message|esc to interrupt$", re.IGNORECASE)
+_PROSE_MARKER = re.compile(r"^\s*[•⏺◦└⎿✻·]\s")
 _WORKING_PATTERNS = [
     r"esc to interrupt", r"\besc\b[^.]*\binterrupt\b", r"ctrl\+c to (cancel|stop|interrupt)",
-    r"press esc[^.]*\b(stop|cancel|interrupt)\b", r"working\s*(?:\(|\u2022|\.\.\.)",
-    r"thinking\s*(?:\(|\u2022|\.\.\.)", r"esc replaces",
+    r"press esc[^.]*\b(stop|cancel|interrupt)\b", r"working\s*(?:\(|•|\.\.\.)",
+    r"thinking\s*(?:\(|•|\.\.\.)", r"esc replaces", r"\(esc to cancel,\s*\d+",
     r"\b(?:generating|searching|reading|running|building|analyzing)\b[^.]{0,80}"
     r"\b(?:esc|ctrl\+c)\b[^.]{0,40}\b(?:cancel|stop|interrupt)\b",
 ]
@@ -508,7 +557,7 @@ _PATTERN_CACHE = {}
 
 
 def _compile_patterns(defaults, extra_env):
-    extra = os.environ.get(extra_env)
+    extra = os.environ.get(extra_env) if extra_env else None
     key = (tuple(defaults), extra_env, extra)
     cached = _PATTERN_CACHE.get(key)
     if cached is not None:
@@ -526,26 +575,45 @@ def _compile_patterns(defaults, extra_env):
     return compiled
 
 
-def classify_screen(lines, limit=24):
+def classify_screen(lines, limit=24, agent=None):
     """Return (state, prompt) where state is blocked, working, or idle.
 
-    ``prompt`` is the screen line that looked like it needs the user.
+    ``prompt`` is the screen line that looked like it needs the user. Passing
+    the ``agent`` key enables that harness's own dialog fingerprints; generic
+    patterns still apply to every agent.
     """
     tail = [line.rstrip() for line in lines[-limit:] if line.strip()]
-    blocked = _compile_patterns(_BLOCKED_PATTERNS, "AGMUX_BLOCKED_PATTERNS")
     working = _compile_patterns(_WORKING_PATTERNS, "AGMUX_WORKING_PATTERNS")
+    strong = _compile_patterns(_BLOCKED_STRONG, "AGMUX_BLOCKED_PATTERNS")
+    weak = _compile_patterns(_BLOCKED_WEAK, None)
+    specific = _compile_patterns(_AGENT_BLOCKED.get(agent or "", []),
+                                 None)
 
     def is_working(line):
         return any(pattern.search(line) for pattern in working)
 
+    # 1. This agent's own dialogs: authoritative, and they beat live-work text.
     for line in reversed(tail):
-        # A line like "Reviewing approval request (10s - esc to interrupt)" is
-        # live work, not a prompt for the user, so live work wins.
+        if any(pattern.search(line) for pattern in specific):
+            return "blocked", line.strip()[:200]
+
+    def idle_below(index):
+        return any(_IDLE_COMPOSER.search(later) and not is_working(later)
+                   for later in tail[index + 1:])
+
+    # 2. Generic patterns, newest line first. A question the assistant wrote in
+    # prose, with an idle composer drawn beneath it, is not waiting on anyone.
+    for index in range(len(tail) - 1, -1, -1):
+        line = tail[index]
+        # "Reviewing approval request (10s - esc to interrupt)" is live work.
         if is_working(line):
             continue
-        for pattern in blocked:
-            if pattern.search(line):
-                return "blocked", line.strip()[:200]
+        if any(pattern.search(line) for pattern in strong):
+            return "blocked", line.strip()[:200]
+        if len(tail) - index > 14 or _PROSE_MARKER.match(line) or idle_below(index):
+            continue
+        if any(pattern.search(line) for pattern in weak):
+            return "blocked", line.strip()[:200]
     joined = "\n".join(tail)
     if any(pattern.search(joined) for pattern in working):
         return "working", ""
@@ -1507,7 +1575,8 @@ class Tmux:
             if (detect and row["agent"] and row["agent"] != "shell" and state
                     and state["process"] not in SHELL_COMMANDS):
                 try:
-                    state_name, prompt = classify_screen(self.pane_lines(state["pane"]))
+                    state_name, prompt = classify_screen(self.pane_lines(state["pane"]),
+                                                         agent=row["agent"])
                 except Error:
                     state_name, prompt = "", ""
                 row["state"], row["prompt"] = state_name, prompt
@@ -1986,7 +2055,7 @@ def blocked_transition(previous_prompt, state, prompt):
     return None, previous_prompt
 
 
-def watch_blocked(tmux, target, label, session, stop_event, interval):
+def watch_blocked(tmux, target, label, session, stop_event, interval, agent=None):
     """While an agent runs, poll its pane and notify on a new blocked prompt."""
     last_prompt = None
     while not stop_event.wait(interval):
@@ -1994,7 +2063,7 @@ def watch_blocked(tmux, target, label, session, stop_event, interval):
             lines = tmux.pane_lines(target)
         except Error:
             continue
-        state, prompt = classify_screen(lines)
+        state, prompt = classify_screen(lines, agent=agent)
         notice, last_prompt = blocked_transition(last_prompt, state, prompt)
         if notice:
             send_blocked_notification(label, session, notice)
@@ -2038,7 +2107,7 @@ def launch_agent(agent_key, executable, shell, session, arguments, notify_enable
         target = pane or f"{sid}:"
         threading.Thread(target=watch_blocked,
                          args=(tmux, target, profile.label, session, stop_event,
-                               watch_interval()), daemon=True).start()
+                               watch_interval(), profile.key), daemon=True).start()
     try:
         child = subprocess.Popen([executable, *arguments])
         while True:

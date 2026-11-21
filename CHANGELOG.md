@@ -4,6 +4,19 @@ All notable changes to agmux are documented here. The format is loosely based
 on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [semantic versioning](https://semver.org/).
 
+## [0.8.1]
+
+### Fixed
+- "Needs input" detection is now per harness. Codex, Claude Code, OpenCode,
+  Gemini, Aider, Crush, and Goose each have their own approval/question/trust
+  dialog fingerprints (Codex, Claude Code, and OpenCode wording checked against
+  the installed binaries). These win even when the screen also says "esc to
+  interrupt", which Codex shows on its question screens.
+- Questions the assistant merely wrote in prose ("Should I continue?") no longer
+  flag a session while its idle composer is drawn below them, and loose English
+  matches are only trusted near the bottom of the screen.
+- Notifications use the same per-agent detection.
+
 ## [0.8.0]
 
 ### Changed
