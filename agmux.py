@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover - sqlite3 is in the standard library
 
 
 APP = "agmux"
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 SELF = Path(__file__).resolve()
 
 
@@ -2179,19 +2179,62 @@ def put_runs(screen, y, runs, renderer, x=0, limit=None):
         x += len(text)
 
 
-def prompt(screen, label, initial="", style=None):
+def complete_path(value):
+    """Tab-complete a directory path: extend to the longest common prefix."""
+    expanded = os.path.expanduser(value)
+    base, _, partial = expanded.rpartition("/")
+    folder = base + "/" if base or expanded.startswith("/") else "./"
+    try:
+        names = sorted(n for n in os.listdir(folder)
+                       if n.startswith(partial) and os.path.isdir(os.path.join(folder, n))
+                       and (partial.startswith(".") or not n.startswith(".")))
+    except OSError:
+        return value
+    if not names:
+        return value
+    common = os.path.commonprefix(names)
+    done = (base + "/" if base or expanded.startswith("/") else "") + common
+    if len(names) == 1:
+        done += "/"
+    if value.startswith("~") and expanded != value:
+        home = os.path.expanduser("~")
+        if done.startswith(home):
+            done = "~" + done[len(home):]
+    return done if len(done) >= len(value) else value
+
+
+def prompt(screen, label, initial="", style=None, placeholder="", path=False):
+    """One-line editor drawn at the bottom of the screen.
+
+    Starts empty unless ``initial`` is given. ``placeholder`` is shown dimmed
+    while the line is empty so Enter-on-blank can mean "use the suggestion".
+    Supports cursor movement, Ctrl-W/K/U/A/E, and Tab path completion.
+    Returns the text, or None when cancelled.
+    """
     style = style or Style()
-    value = initial
+    value, cursor = initial, len(initial)
     screen.timeout(-1)
     try:
         curses.curs_set(1)
     except curses.error:
         pass
     while True:
-        height, _ = screen.getmaxyx()
-        screen.move(max(0, height - 2), 0)
+        height, width = screen.getmaxyx()
+        row = max(0, height - 2)
+        screen.move(row, 0)
         screen.clrtoeol()
-        put(screen, height - 2, 0, f"{label}: {value}", style.heading)
+        head = f"{label}: "
+        put(screen, row, 0, head, style.heading)
+        if value:
+            put(screen, row, len(head), value, style.default)
+        elif placeholder:
+            put(screen, row, len(head), placeholder, style.muted)
+        hint = "Enter accept | Esc cancel" + (" | Tab complete" if path else "")
+        put(screen, row + 1, 0, hint, style.help)
+        try:
+            screen.move(row, min(width - 2, len(head) + cursor))
+        except curses.error:
+            pass
         screen.refresh()
         key = screen.get_wch()
         if key in ("\n", "\r", curses.KEY_ENTER):
@@ -2200,17 +2243,54 @@ def prompt(screen, label, initial="", style=None):
             value = None
             break
         if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-            value = value[:-1]
+            if cursor:
+                value, cursor = value[:cursor - 1] + value[cursor:], cursor - 1
+        elif key == curses.KEY_DC:
+            value = value[:cursor] + value[cursor + 1:]
+        elif key == curses.KEY_LEFT:
+            cursor = max(0, cursor - 1)
+        elif key == curses.KEY_RIGHT:
+            cursor = min(len(value), cursor + 1)
+        elif key in (curses.KEY_HOME, "\x01"):
+            cursor = 0
+        elif key in (curses.KEY_END, "\x05"):
+            cursor = len(value)
         elif key == "\x15":
-            value = ""
+            value, cursor = value[cursor:], 0
+        elif key == "\x0b":
+            value = value[:cursor]
+        elif key == "\x17":
+            head_text = value[:cursor].rstrip()
+            cut = max(head_text.rfind(" "), head_text.rfind("/"), -1) + 1
+            value, cursor = value[:cut] + value[cursor:], cut
+        elif key == "\t" and path:
+            completed = complete_path(value[:cursor])
+            value, cursor = completed + value[cursor:], len(completed)
         elif isinstance(key, str) and key.isprintable():
-            value += key
+            value, cursor = value[:cursor] + key + value[cursor:], cursor + 1
     screen.timeout(200)
     try:
         curses.curs_set(0)
     except curses.error:
         pass
     return value
+
+
+def confirm_key(screen, question, style=None, danger=True):
+    """Single-keypress yes/no. Only ``y`` confirms; anything else cancels."""
+    style = style or Style()
+    screen.timeout(-1)
+    height, _ = screen.getmaxyx()
+    screen.move(max(0, height - 2), 0)
+    screen.clrtoeol()
+    put(screen, height - 2, 0, f"{question} [y/N]", style.warning if danger else style.heading)
+    screen.refresh()
+    try:
+        key = screen.get_wch()
+    except curses.error:
+        key = ""
+    screen.timeout(200)
+    return key in ("y", "Y")
 
 
 # --------------------------------------------------------------------------
@@ -2457,16 +2537,18 @@ def output_viewer(screen, tmux, row, style=None):
 HELP_SECTIONS = (
     ("Search and move", (
         ("Type", "filter by session name, agent, command, or directory"),
+        ("Enter on no match", "create a new session named by what you typed"),
         ("Up/Down, Tab", "move the selection"),
+        ("Right/Left, Ctrl-T", "switch between Live and History"),
         ("PgUp/PgDn, Home/End", "jump through the list"),
         ("Ctrl-U", "clear the search"),
         ("Ctrl-L", "refresh sessions and preview now"),
     )),
     ("Sessions", (
-        ("Enter", "attach, or restore a saved workspace and attach"),
-        ("Ctrl-N", "start an agent or shell session (short wizard)"),
+        ("Enter", "attach, or (in History) restore a closed session"),
+        ("Ctrl-N", "new session: agent, directory, name (blank name = auto)"),
         ("Ctrl-R", "rename the selected session"),
-        ("Ctrl-D, Delete", "delete a live session or forget a saved one (type its name)"),
+        ("Ctrl-D, Delete", "delete a live session or forget a history entry (press y)"),
         ("Ctrl-W", "add a shell window in the session's directory"),
     )),
     ("View", (
@@ -2497,7 +2579,8 @@ HELP_SECTIONS = (
     ("What you are seeing", (
         ("", "Sessions whose agent needs input are flagged and sorted first."),
         ("", "Finished sessions get a check mark and a notification."),
-        ("", "Saved sessions survive reboot. Enter restores their windows and panes."),
+        ("", "Closed and post-reboot sessions live in the History tab (Right arrow),"),
+        ("", "not on the main page. Enter there restores windows and panes."),
         ("", "Codex opens saved history; other agents restore to shells by default."),
         ("", "cpu X% and mem Y are this machine's CPU and RAM for the session's"),
         ("", "processes, not token, context-window, or rate-limit usage."),
@@ -2624,18 +2707,14 @@ def describe_lines(info, style=None, color=False):
 
 
 def confirm_delete(screen, tmux, info, style=None):
-    """Red confirmation screen; requires typing the exact name.
+    """Red confirmation screen; a single ``y`` keypress confirms.
 
     Returns "deleted", "cancelled", or "changed". On "changed" nothing was
     deleted and the caller should ask the user to start confirmation again.
     """
     style = style or Style()
-    typed, message, result = "", "", "cancelled"
+    message, result = "", "cancelled"
     screen.timeout(-1)
-    try:
-        curses.curs_set(1)
-    except curses.error:
-        pass
     while True:
         height, width = screen.getmaxyx()
         screen.erase()
@@ -2653,36 +2732,24 @@ def confirm_delete(screen, tmux, info, style=None):
         if message:
             put(screen, height - 5, 0, message, style.warning)
         else:
-            put(screen, height - 5, 0, "Type the exact name below, or press Esc to cancel.",
+            put(screen, height - 5, 0, "Press y to delete, or any other key to cancel.",
                 style.help)
-        put(screen, height - 2, 0, f"> {typed}", style.warning)
+        put(screen, height - 2, 0, "Delete this session? [y/N]", style.warning)
         screen.refresh()
         try:
             key = screen.get_wch()
         except curses.error:
             continue
-        if key in ("\x1b", "\x03"):
+        if key not in ("y", "Y"):
             result = "cancelled"
             break
-        if key in ("\n", "\r", curses.KEY_ENTER):
-            if not confirm_delete_answer(info["name"], typed):
-                message = "Name did not match. Type it exactly, or Esc to cancel."
-                typed = ""
-                continue
-            try:
-                tmux.delete(info["id"], expected=info)
-                result = "deleted"
-            except Error as error:
-                message = str(error)
-                result = "changed"
-            break
-        if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-            typed, message = typed[:-1], ""
-        elif key == "\x15":
-            typed, message = "", ""
-        elif isinstance(key, str) and key.isprintable():
-            typed += key
-            message = ""
+        try:
+            tmux.delete(info["id"], expected=info)
+            result = "deleted"
+        except Error as error:
+            message = str(error)
+            result = "changed"
+        break
     screen.timeout(200)
     try:
         curses.curs_set(0)
@@ -2691,36 +2758,61 @@ def confirm_delete(screen, tmux, info, style=None):
     return result
 
 
-def draw_row(screen, y, row, selected, style):
+_STATE_WORD = {"blocked": "needs input", "running": "working", "finished": "done",
+               "idle": "idle", "shell": "shell", "saved": "closed"}
+
+
+def fit(text, width):
+    """Pad or ellipsize ``text`` to exactly ``width`` cells."""
+    text = clean(text)
+    if len(text) > width:
+        mark = GLYPH["ellipsis"]
+        return text[:max(0, width - len(mark))] + mark
+    return text.ljust(width)
+
+
+def draw_row(screen, y, row, selected, style, name_width=18):
+    """One aligned line: marker, name, agent, state, resources, directory, age."""
+    _, width = screen.getmaxyx()
     status = row_status(row)
     glyph = {"finished": GLYPH["finished"], "running": GLYPH["running"],
-             "blocked": GLYPH["blocked"], "idle": GLYPH["idle"]}.get(status, GLYPH["shell"])
+             "blocked": GLYPH["blocked"], "idle": GLYPH["idle"],
+             "saved": "\u25cb" if GLYPH["dot"] != "*" else "o"}.get(status, GLYPH["shell"])
     glyph_role = {"finished": "finished", "running": "attached",
-                  "blocked": "warning", "idle": "muted"}.get(status, "muted")
-    segments = [(glyph + " ", glyph_role), (row["name"], "name")]
+                  "blocked": "warning", "idle": "muted", "saved": "muted"}.get(status, "muted")
     agent = AGENTS.get(row.get("agent") or "")
-    if agent and not agent.is_shell:
-        segments.append(("  " + agent.label, agent.accent))
-    if status == "blocked":
-        segments.append(("  needs input", "warning"))
-    elif status == "saved":
-        segments.append(("  saved - Enter restore", "secondary"))
-    segments.append((f"  {row['windows']}w", "muted"))
-    if row["attached"]:
-        label = "attached" if row["attached"] == 1 else f"{row['attached']} clients"
-        segments.append(("  " + label, "attached"))
-    resource = resource_label(row.get("cpu"), row.get("rss"))
-    if resource:
-        segments.append(("  " + resource, "secondary"))
-    if row.get("process"):
-        segments.append(("  " + clean(row["process"]), "default"))
+    state = _STATE_WORD.get(status, status)
+    state_role = {"blocked": "warning", "running": "attached",
+                  "finished": "finished"}.get(status, "muted")
+    segments = [(" " + glyph + " ", glyph_role),
+                (fit(row["name"], name_width) + "  ", "name"),
+                (fit(agent.label if agent and not agent.is_shell else "shell", 9) + " ",
+                 agent.accent if agent and not agent.is_shell else "muted"),
+                (fit(state, 11) + " ", state_role)]
+    if row.get("saved"):
+        segments.append((fit(f"{row['windows']} win", 7), "muted"))
+    else:
+        if row["attached"]:
+            label = "attached" if row["attached"] == 1 else f"{row['attached']} clients"
+            segments.append((fit(label, 9) + " ", "attached"))
+        else:
+            segments.append((" " * 10, "muted"))
+        resource = resource_label(row.get("cpu"), row.get("rss"))
+        if resource:
+            segments.append((resource + "  ", "secondary"))
     if row.get("cwd"):
-        segments.append(("  " + short_path(row["cwd"]), "muted"))
+        segments.append((short_path(row["cwd"]), "muted"))
     age = humanize_age(row.get("activity"))
     if age:
-        segments.append(("  " + age, "muted"))
+        age = age + (" ago" if row.get("saved") else "")
+        text_len = sum(len(clean(t)) for t, _ in segments)
+        room = width - 1 - text_len - len(age) - 2
+        if room >= 0:
+            segments.append((" " * (room + 2), "muted"))
+            segments.append((age, "muted"))
     if selected:
-        put(screen, y, 0, "".join(text for text, _ in segments), style.selected)
+        line = "".join(clean(text) for text, _ in segments)
+        put(screen, y, 0, line.ljust(width - 1), style.selected)
         return
     x = 0
     for text, role in segments:
@@ -2729,8 +2821,13 @@ def draw_row(screen, y, row, selected, style):
         x += len(text)
 
 
-def choose(screen, title, options, style, hint="Up/Down select | Enter confirm | Esc cancel"):
-    """A small searchable list chooser. Returns the selected value or None."""
+def choose(screen, title, options, style, hint="Type to filter | Up/Down select | Enter confirm | Esc cancel",
+           paths=False):
+    """A small searchable list chooser. Returns the selected value or None.
+
+    With ``paths`` a query that looks like a directory (starts with ``/``,
+    ``~`` or ``.``) becomes the first option, so you can type a path directly.
+    """
     screen.keypad(True)
     screen.timeout(200)
     query, selection = "", 0
@@ -2741,16 +2838,28 @@ def choose(screen, title, options, style, hint="Up/Down select | Enter confirm |
     while True:
         matches = [o for o in options
                    if fuzzy(query, o["label"] + " " + o.get("note", ""))]
+        if paths and query[:1] in ("/", "~", "."):
+            typed = os.path.abspath(os.path.expanduser(query))
+            if os.path.isdir(typed):
+                matches.insert(0, dict(label=query, note="use this directory", value=typed))
+            else:
+                matches = [dict(label=query, note="Tab completes - not a directory yet",
+                                value=None, enabled=False)] + matches
         selection = max(0, min(selection, len(matches) - 1))
         height, width = screen.getmaxyx()
         screen.erase()
         put(screen, 0, 0, title, style.heading)
         put(screen, 1, 0, hint, style.help)
-        put(screen, 2, 0, f"Search: {query}", style.heading)
+        put(screen, 2, 0, "\u203a " if GLYPH["dot"] != "*" else "> ", style.heading)
+        if query:
+            put(screen, 2, 2, query, style.default)
+        else:
+            put(screen, 2, 2, "type to filter" + (", or paste a path" if paths else ""),
+                style.muted)
         visible = max(1, height - 5)
         start = max(0, selection - visible + 1)
         for index, option in enumerate(matches[start:start + visible], start):
-            text = ("> " if index == selection else "  ") + option["label"]
+            text = (GLYPH["idle"] + " " if index == selection else "  ") + option["label"]
             if option.get("note"):
                 text += "  " + option["note"]
             attr = style.selected if index == selection else (
@@ -2767,8 +2876,12 @@ def choose(screen, title, options, style, hint="Up/Down select | Enter confirm |
         if key in ("\x1b", "\x03"):
             return None
         if key in ("\n", "\r", curses.KEY_ENTER) and matches:
-            return matches[selection].get("value", matches[selection]["label"])
-        if key in (curses.KEY_DOWN, "\t"):
+            if matches[selection].get("enabled", True):
+                return matches[selection].get("value", matches[selection]["label"])
+            continue
+        if key == "\t" and paths and query[:1] in ("/", "~", "."):
+            query = complete_path(query)
+        elif key in (curses.KEY_DOWN, "\t"):
             selection = (selection + 1) % max(1, len(matches))
         elif key in (curses.KEY_UP, curses.KEY_BTAB):
             selection = (selection - 1) % max(1, len(matches))
@@ -2780,11 +2893,43 @@ def choose(screen, title, options, style, hint="Up/Down select | Enter confirm |
             query += key
 
 
-_CUSTOM_DIRECTORY = "@custom-directory"
+def _recent_file():
+    return state_directory() / "recent.json"
 
 
-def new_session_flow(screen, tmux, style, notify=True):
-    """Ctrl-N wizard: choose an agent, a directory, then a name."""
+def load_recent():
+    """Last agent and recently used directories (best effort, never raises)."""
+    try:
+        data = json.loads(_recent_file().read_text())
+        agent = data.get("agent") if isinstance(data.get("agent"), str) else ""
+        dirs = [d for d in data.get("dirs", []) if isinstance(d, str)][:8]
+        return agent, dirs
+    except (OSError, ValueError, AttributeError):
+        return "", []
+
+
+def remember_recent(agent, cwd):
+    agent_old, dirs = load_recent()
+    dirs = [cwd] + [d for d in dirs if d != cwd]
+    try:
+        path = _recent_file()
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"agent": agent, "dirs": dirs[:8]}, handle)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def new_session_flow(screen, tmux, style, notify=True, name=None):
+    """Ctrl-N wizard: agent, then directory, then an optional name.
+
+    The last agent and recent directories float to the top, a typed path is
+    accepted directly, and a blank name means "use the suggestion".
+    """
+    last_agent, recent_dirs = load_recent()
     options = []
     for agent in AGENTS.values():
         if agent.is_shell:
@@ -2793,39 +2938,43 @@ def new_session_flow(screen, tmux, style, notify=True):
         elif shutil.which(agent.binary):
             options.append(dict(label=agent.label, note=f"start {agent.binary}",
                                 value=agent.key, enabled=True))
-    agent = choose(screen, "New session - choose what to run", options, style)
+    options.sort(key=lambda o: o["value"] != last_agent)
+    if options and options[0]["value"] == last_agent:
+        options[0]["note"] += "  (last used)"
+    agent = choose(screen, "New session (1/3): what should it run?", options, style)
     if agent is None:
         return None
 
-    directories = [dict(label=str(Path.cwd()), note="current directory",
-                        value=str(Path.cwd()))]
+    directories, seen = [], set()
+
+    def add(label, note, value):
+        if value not in seen and Path(value).is_dir():
+            seen.add(value)
+            directories.append(dict(label=label, note=note, value=value))
+
+    add(str(Path.cwd()), "current directory", str(Path.cwd()))
+    for directory in recent_dirs:
+        add(short_path(directory), "recent", directory)
     try:
         for repo in repos():
-            directories.append(dict(label=repo["name"], note=short_path(repo["id"]),
-                                    value=repo["id"]))
+            add(repo["name"], short_path(repo["id"]), repo["id"])
     except Error:
         pass
-    directories.append(dict(label="~", note="home directory", value=str(Path.home())))
-    directories.append(dict(label="Other directory", note="type any path",
-                            value=_CUSTOM_DIRECTORY))
-    cwd = choose(screen, f"New {AGENTS[agent].label} session - choose a directory",
-                 directories, style)
+    add("~", "home directory", str(Path.home()))
+    cwd = choose(screen, f"New {AGENTS[agent].label} session (2/3): which directory?",
+                 directories, style, paths=True,
+                 hint="Type to filter, or a path (Tab completes) | Enter confirm | Esc cancel")
     if cwd is None:
         return None
-    if cwd == _CUSTOM_DIRECTORY:
-        typed = prompt(screen, "Directory (~ is expanded; Ctrl-U clears)",
-                       str(Path.cwd()), style)
-        if typed is None:
-            return None
-        cwd = str(Path(typed).expanduser())
-        if not Path(cwd).is_dir():
-            raise Error(f"Directory does not exist: {cwd}")
 
     suggestion = default_name(cwd, tmux.sessions(), agent)
-    name = prompt(screen, "Session name (Ctrl-U clears)", suggestion, style)
     if name is None:
-        return None
+        name = prompt(screen, "Name (3/3)", "", style, placeholder=suggestion + "  (Enter = use this)")
+        if name is None:
+            return None
+        name = name.strip() or suggestion
     sid = tmux.create(name, cwd, agent=agent, notify=notify)
+    remember_recent(agent, cwd)
     return dict(id=sid, name=name)
 
 
@@ -2839,6 +2988,8 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
     except curses.error:
         pass
     query, selection, selected_id = "", 0, None
+    view = "live"
+    live_rows, saved_list = [], []
     rows, refreshed, message, message_alert = [], 0.0, "", False
     preview_key, preview_at, follow_key = None, 0.0, None
     preview_caption, preview_body = "", []
@@ -2847,16 +2998,17 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
         now = time.monotonic()
         if now - refreshed > 2:
             try:
-                rows = tmux.session_details(detect=True, resources=resources)
+                live_rows = tmux.session_details(detect=True, resources=resources)
             except Error as error:
-                rows, message, message_alert = [], str(error), True
+                live_rows, message, message_alert = [], str(error), True
             try:
-                rows += saved_rows(tmux)
+                saved_list = saved_rows(tmux)
                 if tmux.recovery_error:
                     message, message_alert = tmux.recovery_error, True
             except (Error, OSError) as error:
-                message, message_alert = str(error), True
+                saved_list, message, message_alert = [], str(error), True
             refreshed = now
+        rows = live_rows if view == "live" else saved_list
         ordered = sorted(rows, key=lambda r: (state_priority(r), -r["activity"], r["name"]))
         matches = [row for row in ordered if fuzzy(query, searchable(row))]
         # Preserve selection across refreshes and narrowing the filter.
@@ -2878,47 +3030,66 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
                 pass
             continue
         screen.erase()
-        statuses = [row_status(row) for row in rows]
+        statuses = [row_status(row) for row in live_rows]
         running = statuses.count("running")
         finished = statuses.count("finished")
         blocked = statuses.count("blocked")
         mid = GLYPH["mid"]
         title = f"{APP} {VERSION}"
-        summary = (f"{len(rows)} sessions{mid}{running} running")
+        bits = [f"{len(live_rows)} live"]
+        if running:
+            bits.append(f"{running} working")
         if blocked:
-            summary += f"{mid}{blocked} need input"
-        summary += f"{mid}{finished} done"
-        if statuses.count("saved"):
-            summary += f"{mid}{statuses.count('saved')} saved"
+            bits.append(f"{blocked} need input")
+        if finished:
+            bits.append(f"{finished} done")
+        summary = mid.join(bits)
         if len(title) + len(summary) + 2 > width:
-            summary = f"{len(rows)} sessions{mid}{running} running"
-            if blocked:
-                summary += f"{mid}{blocked}!"
-        if len(title) + len(summary) + 2 > width:
-            summary = f"{len(rows)}/{running}"
+            summary = f"{len(live_rows)} live" + (f"{mid}{blocked}!" if blocked else "")
         put(screen, 0, 0, title, style.heading)
         put_right(screen, 0, summary, style.warning if blocked else style.muted)
-        usage = "    ".join(part for part in (usage_inline(), opencode_inline()) if part)
-        if usage:
-            detail = "Ctrl-G details"
-            room = width - len(detail) - 3
-            if room >= 8:
-                put(screen, 1, 0, usage[:room], style.muted)
-                put_right(screen, 1, detail, style.help)
-            else:
-                put(screen, 1, 0, usage, style.muted)
+        # Tabs: the main page is live sessions only; history is one keypress away.
+        live_tab = f" Live {len(live_rows)} "
+        hist_tab = f" History {len(saved_list)} "
+        put(screen, 1, 0, live_tab, style.selected if view == "live" else style.muted)
+        put(screen, 1, len(live_tab) + 1, hist_tab,
+            style.selected if view == "history" else style.muted)
+        usage = "   ".join(part for part in (usage_inline(), opencode_inline()) if part)
+        tabs_end = len(live_tab) + len(hist_tab) + 3
+        if usage and width - tabs_end - 2 >= len(usage):
+            put_right(screen, 1, usage, style.muted)
+        put(screen, 2, 0, "\u203a " if GLYPH["dot"] != "*" else "> ", style.heading)
+        if query:
+            put(screen, 2, 2, query, style.default)
         else:
-            put(screen, 1, 0, "Ctrl-N new session   Ctrl-G usage   F1 help", style.help)
-        put(screen, 2, 0, f"Search: {query}", style.heading)
+            hint = ("type to filter, or a new name then Enter to create" if view == "live"
+                    else "type to filter closed sessions")
+            put(screen, 2, 2, hint, style.muted)
         list_top = 3
         list_height = max(1, (height - list_top - 2) // 2) if show_preview \
             else max(1, height - list_top - 2)
         start = max(0, selection - list_height + 1)
+        name_width = max(10, min(24, max((len(r["name"]) for r in matches), default=10)))
         for index, row in enumerate(matches[start:start + list_height], start):
-            draw_row(screen, list_top + index - start, row, index == selection, style)
+            draw_row(screen, list_top + index - start, row, index == selection, style,
+                     name_width)
         if not matches:
-            put(screen, list_top, 0,
-                "No matching sessions. Ctrl-N starts one.", style.muted)
+            other = len(saved_list) if view == "live" else len(live_rows)
+            if view == "live" and query:
+                lines = [(f"No live session matches '{query}'.", style.muted),
+                         (f"Enter creates a new session named '{query}'.", style.heading)]
+            elif view == "live":
+                lines = [("No live sessions.", style.muted),
+                         ("Ctrl-N starts one.", style.heading)]
+            elif query:
+                lines = [(f"Nothing in history matches '{query}'.", style.muted)]
+            else:
+                lines = [("History is empty. Closed sessions you can restore show up here.",
+                          style.muted)]
+            if other and view == "live":
+                lines.append((f"{other} closed session(s) in History (press Right).", style.help))
+            for offset, (text, attr) in enumerate(lines):
+                put(screen, list_top + offset, 2, text, attr)
         if show_preview:
             # Give the preview every row the list does not need, so it grows
             # upward when there are few sessions and never shrinks below the
@@ -2964,10 +3135,17 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
                 top = preview_y + offset + max(0, room - len(visible))
                 for index, runs in enumerate(visible):
                     put_runs(screen, top + index, runs, renderer)
-        footer = (message or f"{len(matches)} of {len(rows)} sessions   "
-                  + ("Enter restore" if selected and selected.get("saved") else "Enter attach")
-                  + " \u00b7 Ctrl-N new \u00b7 Ctrl-R rename \u00b7 "
-                  "Ctrl-D delete \u00b7 F1 help").replace("\u00b7", GLYPH["mid"].strip())
+        if message:
+            footer = message
+        elif view == "history":
+            footer = (f"{len(matches)} of {len(saved_list)} closed   Enter restore {mid}"
+                      f" Ctrl-D forget {mid} Left back to live {mid} F1 help").replace("  ", " ")
+        elif not matches and query:
+            footer = f"Enter create '{query}' {mid} Ctrl-U clear {mid} Right history {mid} F1 help"
+        else:
+            footer = (f"{len(matches)} of {len(live_rows)}   Enter attach {mid} Ctrl-N new {mid}"
+                      f" Ctrl-R rename {mid} Ctrl-D delete {mid} Right history {mid} F1 help")
+        footer = footer.replace("  ", " ")
         put(screen, height - 1, 0, footer, style.warning if message_alert else style.muted)
         screen.refresh()
         try:
@@ -2976,6 +3154,17 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
             continue
         if key in ("\x1b", "\x03"):
             return None
+        if key in ("\n", "\r", curses.KEY_ENTER) and not selected and view == "live" \
+                and query.strip():
+            try:
+                created = new_session_flow(screen, tmux, style, notify=notify,
+                                           name=query.strip())
+                if created:
+                    return created
+            except Error as error:
+                message, message_alert = str(error), True
+            refreshed = 0
+            continue
         if key in ("\n", "\r", curses.KEY_ENTER) and selected:
             if selected.get("saved"):
                 try:
@@ -2986,7 +3175,16 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
                     refreshed = 0
                     continue
             return selected
-        if key in (curses.KEY_DOWN, "\t"):
+        if message and not (key == -1):
+            message, message_alert = "", False
+        if key in (curses.KEY_RIGHT, curses.KEY_LEFT, "\x14", curses.KEY_F2):
+            target = {curses.KEY_RIGHT: "history", curses.KEY_LEFT: "live"}.get(
+                key, "history" if view == "live" else "live")
+            if target != view:
+                view, selection, selected_id, query = target, 0, None, ""
+                preview_at, follow_key = 0, None
+                rows = live_rows if view == "live" else saved_list
+        elif key in (curses.KEY_DOWN, "\t"):
             selection = (selection + 1) % max(1, len(matches))
             selected_id = None
         elif key in (curses.KEY_UP, curses.KEY_BTAB):
@@ -3019,8 +3217,10 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
         elif key == curses.KEY_F1:
             show_help(screen, style)
         elif key == "\x12" and selected and not selected.get("saved"):
-            name = prompt(screen, "Rename (Ctrl-U clears)", selected["name"], style)
-            if name is not None:
+            name = prompt(screen, "Rename", "", style,
+                          placeholder=selected["name"] + "  (type a new name)")
+            if name is not None and name.strip() and name.strip() != selected["name"]:
+                name = name.strip()
                 try:
                     tmux.rename(selected_id, name)
                     message, message_alert, refreshed = "Session renamed", False, 0
@@ -3029,8 +3229,7 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
         elif key in ("\x04", curses.KEY_DC) and selected:
             try:
                 if selected.get("saved"):
-                    answer = prompt(screen, "Forget saved workspace (type its name)", "", style)
-                    if answer == selected["name"]:
+                    if confirm_key(screen, f"Forget saved '{selected['name']}'?", style):
                         tmux.workspace_store().forget(selected["name"])
                         message, message_alert = "Forgot saved workspace", False
                     refreshed, preview_at = 0, 0

@@ -119,8 +119,8 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         os.write(master, b'beta')
         time.sleep(0.3)
         os.write(master, b'\x12')
-        wait_output(master, b'Rename (Ctrl-U clears)')
-        os.write(master, b'\x15beta renamed\r')
+        wait_output(master, b'Rename')
+        os.write(master, b'beta renamed\r')
         wait_output(master, b'Session renamed')
         os.write(master, b'\r')
         wait_clients('beta renamed')
@@ -288,14 +288,14 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         master, proc = launch([sys.executable, str(MODULE)])
         wait_output(master, b'agmux 0.')
         os.write(master, b'\x0e')
-        wait_output(master, b'choose what to run')
+        wait_output(master, b'what should it run')
         os.write(master, b'\r')
-        wait_output(master, b'choose a directory')
+        wait_output(master, b'which directory')
         os.write(master, b'demo')
         time.sleep(0.3)
         os.write(master, b'\r')
-        wait_output(master, b'Session name (Ctrl-U clears)')
-        os.write(master, b'\r')
+        wait_output(master, b'Name (3/3)')
+        os.write(master, b'\r')  # blank name accepts the suggestion
         wait_clients('codex-demo-project')
         deadline = time.monotonic() + 5
         while not record.exists() and time.monotonic() < deadline:
@@ -317,16 +317,14 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         master, proc = launch([sys.executable, str(MODULE)])
         wait_output(master, b'agmux 0.')
         os.write(master, b'\x0e')
-        wait_output(master, b'choose what to run')
+        wait_output(master, b'what should it run')
         os.write(master, b'\r')
-        wait_output(master, b'choose a directory')
-        os.write(master, b'Other directory')
-        time.sleep(0.3)
+        wait_output(master, b'which directory')
+        os.write(master, str(custom_project).encode())  # a typed path is accepted directly
+        wait_output(master, b'use this directory')
         os.write(master, b'\r')
-        wait_output(master, b'Directory (~ is expanded')
-        os.write(master, b'\x15' + str(custom_project).encode() + b'\r')
-        wait_output(master, b'Session name (Ctrl-U clears)')
-        os.write(master, b'\x15custom-path\r')
+        wait_output(master, b'Name (3/3)')
+        os.write(master, b'custom-path\r')
         wait_clients('custom-path')
         deadline = time.monotonic() + 5
         cwd = ''
@@ -347,7 +345,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         time.sleep(0.3)
         os.write(master, b'\x04')  # Ctrl-D: open the deletion confirmation
         wait_output(master, b'Delete session - this cannot be undone')
-        os.write(master, b'\x1b')  # Esc cancels, returning to the picker
+        os.write(master, b'n')  # anything but y cancels, returning to the picker
         wait_output(master, b'Enter attach')
         assert 'victim' in tmux('list-sessions', '-F', '#{session_name}').split()
         os.write(master, b'\x17')  # Ctrl-W: detached shell window
@@ -356,7 +354,7 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         assert windows == ['0', '1'], windows
         os.write(master, b'\x04')  # Ctrl-D again, then type the exact name
         wait_output(master, b'Delete session - this cannot be undone')
-        os.write(master, b'victim\r')
+        os.write(master, b'y')
         wait_output(master, b'Deleted session victim')
         sessions = tmux('list-sessions', '-F', '#{session_name}').split()
         assert 'victim' not in sessions and 'bystander' in sessions, sessions
@@ -372,6 +370,10 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
         tmux('kill-server')
         time.sleep(0.1)
         master, proc = launch([sys.executable, str(MODULE)])
+        out = wait_output(master, b'No live sessions')
+        time.sleep(0.3)
+        assert b'reboot-ui' not in out, 'saved session leaked onto the main page'
+        os.write(master, b'\x1bOC')  # Right arrow: open History
         wait_output(master, b'Enter restore')
         os.write(master, b'reboot-ui')
         time.sleep(0.3)
@@ -385,11 +387,13 @@ with tempfile.TemporaryDirectory(prefix='agmux-ui-') as directory:
 
         master, proc = launch([sys.executable, str(MODULE)])
         wait_output(master, b'agmux 0.')
+        os.write(master, b'\x1bOC')
+        wait_output(master, b'Enter restore')
         os.write(master, b'victim')
         time.sleep(0.3)
         os.write(master, b'\x04')
-        wait_output(master, b'Forget saved workspace (type its name)')
-        os.write(master, b'victim\r')
+        wait_output(master, b'Forget saved')
+        os.write(master, b'y')
         wait_output(master, b'Forgot saved workspace')
         os.write(master, b'\x1b')
         wait_exit(master, proc)

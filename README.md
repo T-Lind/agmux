@@ -9,7 +9,7 @@ terminal.
 ![The agmux picker: sessions with agent state, a live preview, and per-session CPU and memory](docs/screenshot.svg)
 
 ```
-agmux 0.7.1                     5 sessions · 2 running · 1 need input · 1 done
+agmux 0.8.0                     5 sessions · 2 running · 1 need input · 1 done
 Codex · 5h 12% · 7d 34%       OpenCode 392K tok · $0.27        Ctrl-G details
 Search:
 ! ty-review    Codex    2w  needs input  cpu 12% · mem 486M  codex  ~/source/repos/ty     2m
@@ -104,7 +104,8 @@ Check everything with `agmux doctor`.
 
 ## Use
 
-Run `agmux` to open the picker. Type to filter by session name, agent, command,
+Run `agmux` to open the picker. The main page lists **live sessions only**;
+closed and post-reboot sessions are in the **History** tab (press Right). Type to filter by session name, agent, command,
 directory, or state; select with Up/Down or Tab/Shift-Tab; press Enter to attach
 (or switch your current client when already inside tmux). Esc cancels. A preview
 shows the selected session's active pane.
@@ -114,11 +115,13 @@ shows the selected session's active pane.
 | type | filter sessions |
 | `Up`/`Down`, `Tab`/`Shift-Tab` | select |
 | `PageUp`/`PageDown`, `Home`/`End` | move through the list |
-| `Enter` | attach / switch, or restore a saved workspace |
-| `Ctrl-N` | new session wizard (agent → directory → name) |
+| `Right`/`Left`, `Ctrl-T` | switch between **Live** sessions and **History** |
+| `Enter` | attach / switch, or (in History) restore a closed session |
+| `Enter` on no match | create a session named by what you typed |
+| `Ctrl-N` | new session wizard (agent → directory → optional name) |
 | `Ctrl-G` | usage-limit panel |
 | `Ctrl-R` | rename the selected session |
-| `Ctrl-D` / `Delete` | delete a live session or forget a saved workspace (typed confirmation) |
+| `Ctrl-D` / `Delete` | delete a live session or forget a history entry (press `y`) |
 | `Ctrl-W` | add a detached shell window in the session's directory |
 | `Ctrl-O` | read-only output viewer with text selection and copy |
 | `Ctrl-P` | show/hide the preview |

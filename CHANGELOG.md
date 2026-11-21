@@ -4,6 +4,27 @@ All notable changes to agmux are documented here. The format is loosely based
 on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [semantic versioning](https://semver.org/).
 
+## [0.8.0]
+
+### Changed
+- The main page now shows **live sessions only**. Closed and post-reboot sessions
+  moved to a **History** tab: press Right (or Ctrl-T / F2) to open it, Left to
+  return. Enter in History restores; Ctrl-D forgets.
+- Cleaner picker: aligned columns (name, agent, state, resources, directory, age),
+  a tab bar with counts, a placeholder in the search box, full-width selection,
+  and footer hints that match the current view.
+- Text prompts start **blank**. The new-session name field shows the suggested name
+  dimmed and Enter on blank accepts it; Rename starts blank and Enter on blank
+  keeps the old name. Prompts are real line editors (cursor keys, Ctrl-A/E/W/K/U).
+- Deleting a live session or forgetting a history entry is a single `y` keypress
+  instead of typing the whole name. The CLI `delete`/`forget` still ask for the name.
+
+### Added
+- Typing a name that matches nothing and pressing Enter creates a session by that
+  name (then asks only for agent and directory).
+- New-session wizard remembers the last agent and recent directories, shows them
+  first, accepts a typed path directly in the directory list, and Tab-completes it.
+
 ## [0.7.1]
 
 ### Fixed

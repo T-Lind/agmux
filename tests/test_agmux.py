@@ -807,6 +807,30 @@ class TmuxIntegration(unittest.TestCase):
 
 
 
+class PromptHelpers(unittest.TestCase):
+    def test_complete_path_extends_to_unique_directory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            (Path(raw) / "alpha-one").mkdir()
+            (Path(raw) / "alpha-two").mkdir()
+            (Path(raw) / "beta").mkdir()
+            self.assertEqual(agmux.complete_path(raw + "/al"), raw + "/alpha-")
+            self.assertEqual(agmux.complete_path(raw + "/be"), raw + "/beta/")
+            self.assertEqual(agmux.complete_path(raw + "/zz"), raw + "/zz")
+
+    def test_recent_choices_round_trip(self):
+        with tempfile.TemporaryDirectory() as raw, \
+                patch.dict(os.environ, {"AGMUX_STATE_DIR": raw}):
+            self.assertEqual(agmux.load_recent(), ("", []))
+            agmux.remember_recent("opencode", "/a")
+            agmux.remember_recent("codex", "/b")
+            agmux.remember_recent("codex", "/a")
+            self.assertEqual(agmux.load_recent(), ("codex", ["/a", "/b"]))
+
+    def test_fit_pads_and_truncates(self):
+        self.assertEqual(agmux.fit("abc", 5), "abc  ")
+        self.assertEqual(len(agmux.fit("abcdefghij", 5)), 5)
+
+
 class AgentMetadata(unittest.TestCase):
     def test_paused_chat_control_detection_is_specific(self):
         for line in ("New activity · ↓ Back to bottom · esc", "↓ Bottom", "↓ Back to bottom"):
