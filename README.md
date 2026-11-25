@@ -9,7 +9,7 @@ terminal.
 ![The agmux picker: sessions with agent state, a live preview, and per-session CPU and memory](docs/screenshot.svg)
 
 ```
-agmux 0.9.1                     5 sessions · 2 running · 1 need input · 1 done
+agmux 0.9.2                     5 sessions · 2 running · 1 need input · 1 done
 Codex · 5h 12% · 7d 34%       OpenCode 392K tok · $0.27        Ctrl-G details
 Search:
 ! ty-review    Codex    2w  needs input  cpu 12% · mem 486M  codex  ~/source/repos/ty     2m
@@ -84,7 +84,7 @@ cd agmux
 
 You can also download the installer archive and its SHA-256 file from the
 [latest release](https://github.com/T-Lind/agmux/releases/latest). In the download
-directory, run `sha256sum -c agmux-0.9.1.tar.gz.sha256`, extract the archive,
+directory, run `sha256sum -c agmux-0.9.2.tar.gz.sha256`, extract the archive,
 and run `./install.sh` inside the extracted directory. Keep that directory in
 place because the installer links the command to it.
 
@@ -366,7 +366,6 @@ On the machine that runs agmux, paste its URL at the hidden setup prompt.
 
 ```bash
 agmux discord --setup
-agmux discord --test
 ```
 
 Put this line in `~/.config/agmux/config` to route agent notifications to
@@ -377,9 +376,15 @@ at `$XDG_CONFIG_HOME/agmux/discord-webhook` (default `~/.config/agmux/discord-we
 notify_cmd = agmux discord -- "{title}" "{session}" "{exit_code}"
 ```
 
-Questions and nonzero exits use the channel's normal notification settings.
-Choose **All Messages** in Discord for phone alerts. Successful completions and
-clean exits arrive silently. Discord receives the event and session name.
+Run `agmux discord --test` after saving the config. With the Discord route
+configured, this sends a completion test using the same arguments as a real
+agent alert. `agmux doctor` reports which notification route is active.
+
+Questions, successful completions, and failures use the channel's normal
+notification settings. Choose **All Messages** in Discord for phone alerts.
+Closing Codex cleanly sends a silent update. To silence successful completions
+as well, insert `--quiet-completions` before the `--` in the configuration line.
+Discord receives the event and session name.
 Automatic names include the start of your first message. Use an explicit name
 for sensitive work. Incoming webhooks provide one-way delivery.
 

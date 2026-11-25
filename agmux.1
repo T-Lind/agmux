@@ -1,4 +1,4 @@
-.TH AGMUX 1 "2026" "agmux 0.9.1" "User Commands"
+.TH AGMUX 1 "2026" "agmux 0.9.2" "User Commands"
 .SH NAME
 agmux \- a terminal control panel for tmux and AI coding agents
 .SH SYNOPSIS
@@ -117,6 +117,10 @@ Set the following in the agmux config file to enable alerts for new launches:
 .nf
 notify_cmd = agmux discord -- "{title}" "{session}" "{exit_code}"
 .fi
+.PP
+Successful turns follow normal Discord channel notification settings. Insert
+.B --quiet-completions
+before the double dash to silence those messages.
 .TP
 .B last
 Switch back to the previous session (inside tmux).

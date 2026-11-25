@@ -50,7 +50,7 @@ _agmux_complete() {
             compgen -W '--json --no-resources' -- "$current"
         )
     elif [[ "$command" == discord && "$current" == -* ]]; then
-        while IFS= read -r word; do COMPREPLY+=("$word"); done < <(compgen -W '--setup --test' -- "$current")
+        while IFS= read -r word; do COMPREPLY+=("$word"); done < <(compgen -W '--setup --test --quiet-completions' -- "$current")
     elif [[ "$command" == watch && "$current" == -* ]]; then
         while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
             compgen -W '--interval --once --existing --no-notify' -- "$current"

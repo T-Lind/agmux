@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -38,7 +39,7 @@ class DiscordAlerts(unittest.TestCase):
 
     def test_urgency_and_metadata(self):
         for title, code, quiet in (("Codex needs input", -1, False),
-                                   ("Codex turn finished", 0, True),
+                                   ("Codex turn finished", 0, False), ("Claude Code finished", 0, False),
                                    ("Codex closed", 0, True), ("Claude Code finished", 3, False)):
             payload = discord.message(title, "@everyone " + self.url, code)
             self.assertEqual(bool(payload["flags"] & discord.SUPPRESS_NOTIFICATIONS), quiet)
@@ -47,6 +48,9 @@ class DiscordAlerts(unittest.TestCase):
             self.assertNotIn(self.path, payload["content"])
             if code > 0:
                 self.assertIn(f"exit {code}", payload["content"])
+        for code, quiet in ((0, True), (1, False)):
+            payload = discord.message("Claude Code finished", "work", code, quiet_completions=True)
+            self.assertEqual(bool(payload["flags"] & discord.SUPPRESS_NOTIFICATIONS), quiet)
 
     def test_cli_hidden_setup_and_acknowledged_post(self):
         with patch("sys.stdin.isatty", return_value=True), \
@@ -82,9 +86,13 @@ class DiscordAlerts(unittest.TestCase):
                     self.assertEqual(agmux.main(["discord", "--test"]), 1)
                 self.assertNotIn(self.path, output.getvalue())
 
-    def test_notification_hook_excludes_prompt_body_and_uses_installed_command(self):
+    def test_configured_hook_excludes_prompt_body_and_uses_installed_command(self):
         custom = 'agmux discord -- "{title}" "{session}" "{exit_code}"'
-        with patch.dict(os.environ, {"AGMUX_NOTIFY_CMD": custom}), patch.object(agmux.subprocess, "Popen") as spawn:
+        config = Path(os.environ["XDG_CONFIG_HOME"]) / "config"
+        config.write_text("notify_cmd = " + custom + "\n")
+        with patch.dict(os.environ), patch.object(agmux.subprocess, "Popen") as spawn:
+            os.environ.pop("AGMUX_NOTIFY_CMD", None)
+            agmux.load_config(config)
             agmux.send_blocked_notification("Codex", "-project", "private question")
             args = spawn.call_args.args[0]
             self.assertEqual(args[1:], [str(agmux.SELF), "discord", "--", "Codex needs input",
@@ -92,6 +100,32 @@ class DiscordAlerts(unittest.TestCase):
             with patch.object(discord, "deliver") as send, patch.object(discord, "load_webhook"):
                 self.assertEqual(agmux.main(args[2:]), 0)
                 self.assertEqual(send.call_args.args[1]["content"], "Codex needs input · -project")
+
+    def test_webhook_test_checks_actual_completion_route_and_refuses_invalid_config(self):
+        config = Path(os.environ["XDG_CONFIG_HOME"]) / "config"
+        route = '"agmux" discord --quiet-completions -- "{title}" "{session}" "{exit_code}"'
+        config.write_text("notify_cmd = " + route + "\n")
+        with patch.dict(os.environ), patch.object(discord, "deliver") as send, \
+                patch.object(discord, "load_webhook"), contextlib.redirect_stdout(io.StringIO()):
+            os.environ.pop("AGMUX_NOTIFY_CMD", None)
+            agmux.load_config(config)
+            self.assertEqual(agmux.main(["discord", "--test"]), 0)
+            payload = send.call_args.args[1]
+            self.assertIn("agmux completion test", payload["content"])
+            self.assertTrue(payload["flags"] & discord.SUPPRESS_NOTIFICATIONS)
+            os.environ["AGMUX_NOTIFY_CMD"] = 'agmux discord -- "{title}'
+            with self.assertRaisesRegex(agmux.Error, "Invalid notify_cmd"):
+                agmux.main(["discord", "--test"])
+            send.assert_called_once()
+
+    def test_inherited_broken_route_is_repaired_without_overriding_other_custom_commands(self):
+        route = 'agmux discord -- "{title}" "{session}" "{exit_code}"'
+        config = Path(os.environ["XDG_CONFIG_HOME"]) / "config"
+        config.write_text("notify_cmd = " + route + "\n")
+        for inherited, expected in ((route[:-1], route), ("other-tool --quiet", "other-tool --quiet")):
+            with patch.dict(os.environ, {"AGMUX_NOTIFY_CMD": inherited}):
+                agmux.load_config(config)
+                self.assertEqual(os.environ["AGMUX_NOTIFY_CMD"], expected)
 
     def test_existing_sessions_are_watched_without_replaying_past_completions(self):
         row = dict(id="$1", name="work", created=123, agent="codex", state="idle",
@@ -101,6 +135,7 @@ class DiscordAlerts(unittest.TestCase):
         complete = dict(row, done_turn="new")
         closed = dict(complete, finished=456, exit_code="0", status="exited")
         tmux = Mock()
+        tmux.run.return_value = ""
         tmux.session_details.side_effect = [
             [row], [blocked, new_session], [blocked], [complete], [complete], [closed], [new_session]]
         with patch.object(agmux.time, "sleep"), patch.object(agmux, "_run_notification") as send, \
@@ -108,3 +143,37 @@ class DiscordAlerts(unittest.TestCase):
             self.assertEqual(agmux.watch_command(tmux, 1, existing=True), 0)
         self.assertEqual([call.args[0] for call in send.call_args_list],
                          ["Codex needs input", "Codex turn finished", "Codex closed"])
+
+    def test_existing_watcher_follows_picker_done_without_a_marker(self):
+        row = dict(agent="codex", status="running", finished=0, done_turn="", unread=1)
+        watch = agmux.WatchedCompletion(row)
+        def poll(**attrs):
+            sample = dict(row, **attrs)
+            return watch.advanced(sample, agmux.row_status(sample))
+        self.assertFalse(poll())
+        self.assertFalse(poll(state="working", unread=0))
+        self.assertFalse(poll(state="blocked"))
+        self.assertTrue(poll(state="idle"))
+        self.assertFalse(poll(state="idle"))
+        self.assertFalse(poll(state="idle", done_turn="later-marker"))
+        self.assertFalse(poll(state="working", unread=0))
+        self.assertTrue(poll(state="idle", done_turn="next-marker"))
+
+    def test_existing_native_completion_needs_two_ready_samples_and_no_replay(self):
+        row = dict(agent="codex", status="running", state="idle", finished=0, done_turn="",
+                   native_turn="old", completed_turn="old", ready_turn="old")
+        watch = agmux.WatchedCompletion(row)
+        self.assertFalse(watch.advanced(row, "idle"))
+        ready = dict(row, native_turn="new", completed_turn="new", ready_turn="new")
+        self.assertFalse(watch.advanced(ready, "idle"))
+        self.assertFalse(watch.advanced(dict(ready, ready_turn=""), "blocked"))
+        self.assertFalse(watch.advanced(ready, "idle"))
+        self.assertTrue(watch.advanced(ready, "idle"))
+        self.assertFalse(watch.advanced(dict(ready, done_turn="new"), "finished"))
+
+    def test_restarted_watcher_skips_wrappers_with_same_notification_route(self):
+        tmux = Mock()
+        route = 'agmux discord -- "{title}" "{session}" "{exit_code}"'
+        tmux.run.return_value = f"$1\t%1\t{route}\n$2\t%2\t\n$3\t\t{route}"
+        with patch.dict(os.environ, {"AGMUX_NOTIFY_CMD": route}):
+            self.assertEqual(agmux.existing_notification_owners(tmux), {"$1"})

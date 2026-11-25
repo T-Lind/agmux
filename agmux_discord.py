@@ -53,12 +53,12 @@ def load_webhook():
         return webhook_path(handle.read(2048))
 
 
-def message(title, session, exit_code):
+def message(title, session, exit_code, quiet_completions=False):
     if session and exit_code and not title.endswith("needs input"):
         title = f"{title} (exit {exit_code})"
     content = f"{title} · {session}" if session else title
     flags = SUPPRESS_EMBEDS
-    if exit_code == 0 and not title.endswith("needs input"):
+    if exit_code == 0 and (quiet_completions or title.endswith(" closed")) and not title.endswith("needs input"):
         flags |= SUPPRESS_NOTIFICATIONS
     return {"content": WEBHOOK.sub("[webhook]", content)[:2000],
             "allowed_mentions": {"parse": []}, "flags": flags}
@@ -103,10 +103,10 @@ def run(args, parser):
             print('notify_cmd = agmux discord -- "{title}" "{session}" "{exit_code}"')
         else:
             payload = (message("agmux Discord alerts connected", "", -1) if args.test else
-                       message(args.title, args.session, args.exit_code))
+                       message(args.title, args.session, args.exit_code, args.quiet_completions))
             deliver(load_webhook(), payload)
             if args.test:
-                print("Discord accepted the test notification.")
+                print("Discord accepted the direct webhook test. Run agmux doctor to check agent notification routing.")
     except (OSError, HTTPException, UnicodeError, EOFError):
         print("agmux-discord: could not read the private webhook file or reach Discord.", file=sys.stderr)
         return 1

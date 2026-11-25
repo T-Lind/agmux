@@ -4,6 +4,18 @@ All notable changes to agmux are documented here. The format is loosely based
 on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [semantic versioning](https://semver.org/).
 
+## [0.9.2]
+
+- Fixed config parsing that removed the closing quote from the documented
+  Discord notification command. The webhook test now exercises the configured
+  Discord command and reports an invalid template.
+- Discord now uses the channel's normal notification settings for successful
+  turns. Add `--quiet-completions` to the Discord notification command to
+  keep successful completions silent. Closing Codex cleanly stays silent.
+- The existing-session watcher recognizes the picker's done transition on
+  older agents and confirmed Codex turn completions. Restarting the watcher
+  skips managed sessions already using the same notification command.
+
 ## [0.9.1]
 
 - Added opt-in Discord alerts with private webhook setup and a delivery test.

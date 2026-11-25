@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover - sqlite3 is in the standard library
 
 
 APP = "agmux"
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 SELF = Path(__file__).resolve()
 
 
@@ -104,9 +104,29 @@ def load_config(path=None):
             continue
         key, _, value = line.partition("=")
         env_name = _CONFIG_KEYS.get(key.strip().lower().replace("-", "_"))
-        if not env_name or env_name in os.environ:
+        if not env_name:
             continue
-        os.environ[env_name] = value.strip().strip("'\"")
+        raw_value = value.strip()
+        value = raw_value
+        # Unwrap a quoted config value, preserving quotes around individual
+        # arguments in commands such as: agmux discord -- "{title}" "{session}".
+        if (len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]
+                and (env_name != "AGMUX_NOTIFY_CMD" or value[0] not in value[1:-1])):
+            value = value[1:-1]
+        if env_name in os.environ:
+            inherited = os.environ[env_name]
+            # tmux sessions launched by 0.9.1 can still export the broken
+            # value. Recover only the exact invalid form of this config line.
+            if (env_name != "AGMUX_NOTIFY_CMD" or inherited == value
+                    or inherited != raw_value.strip("'\"")):
+                continue
+            try:
+                shlex.split(inherited)
+            except ValueError:
+                pass
+            else:
+                continue
+        os.environ[env_name] = value
         applied[env_name] = os.environ[env_name]
     return applied
 
@@ -1843,6 +1863,12 @@ class Tmux:
                         (state["identity"] if row["status"] == "running" else ""))
                     state_name, prompt = agent_state(row["agent"], self.visible_lines(state["pane"]),
                                                      state["title"], turn)
+                    if turn:
+                        row["native_turn"] = turn[0]
+                        if turn[1] == "completed":
+                            row["completed_turn"] = turn[0]
+                            if state_name == "idle" and state["title"].startswith("Ready | "):
+                                row["ready_turn"] = turn[0]
                     if (row["status"] == "running" and row["done_turn"] and
                             (not turn or turn[:2] != (row["done_turn"], "completed"))):
                         row["unread"] = 0
@@ -2320,14 +2346,18 @@ def notify_default():
     return value not in ("0", "false", "no", "off")
 
 
+def notification_argv(command, title, body, session, exit_code):
+    return [part.format(title=title, body=body, session=session, exit_code=exit_code)
+            for part in shlex.split(command)]
+
+
 def _run_notification(title, body, session, exit_code=-1):
     """Best-effort desktop/terminal notice. Never blocks or raises."""
     title, body, session = clean(title), clean(body), clean(session)
     custom = os.environ.get("AGMUX_NOTIFY_CMD")
     if custom:
         try:
-            parts = [part.format(title=title, body=body, session=session,
-                                 exit_code=exit_code) for part in shlex.split(custom)]
+            parts = notification_argv(custom, title, body, session, exit_code)
             if parts[:2] == [APP, "discord"]:
                 parts[:1] = [sys.executable, str(SELF)]
             if parts:
@@ -3946,7 +3976,11 @@ def doctor(tmux):
         print(f"  {agent.label:<9} {found or 'missing'}")
     notify = 'on' if notify_default() else 'off'
     if os.environ.get("AGMUX_NOTIFY_CMD"):
-        notify += " (custom command)"
+        try:
+            route = notification_argv(os.environ["AGMUX_NOTIFY_CMD"], "title", "body", "session", 0)
+            notify += " (Discord)" if route[:2] == [APP, "discord"] else " (custom command)"
+        except (ValueError, KeyError, IndexError):
+            notify += " (invalid notify_cmd quoting or placeholder)"
     elif not shutil.which("notify-send"):
         notify += " (notify-send not found)"
     print(f"Notifications: {notify}")
@@ -3972,6 +4006,55 @@ def doctor(tmux):
           f"{statuses.count('finished')} finished)")
 
 
+class WatchedCompletion:
+    """Follow one already-open agent across polls without replaying its initial state."""
+
+    def __init__(self, row):
+        self.exit_at = row["finished"]
+        self.announced = row.get("completed_turn") or row["done_turn"]
+        self.ready = row.get("ready_turn")
+        self.was_done = row_status(row) == "finished"
+
+    def advanced(self, row, status):
+        ready = row.get("ready_turn")
+        marker = row["done_turn"]
+        done = status == "finished"
+        candidate = None
+        if status not in ("running", "blocked", "exited"):
+            if ready and (ready == self.ready or marker == ready or done):
+                candidate = ready
+            elif done and row.get("completed_turn"):
+                candidate = row["completed_turn"]
+            elif marker and (not row.get("native_turn") or marker == row.get("completed_turn")):
+                candidate = marker
+        # Older wrappers can publish just the unread/done badge. If a marker
+        # arrives a poll later for that same badge, remember it without repeating it.
+        new = bool(candidate and candidate != self.announced)
+        if candidate:
+            if self.was_done and not self.announced:
+                new = False
+            self.announced = candidate
+        elif done and not self.was_done and not (row.get("native_turn") or marker):
+            self.announced = None
+            new = True
+        self.ready, self.was_done = ready, done
+        return new
+
+
+def existing_notification_owners(tmux):
+    """Managed wrappers launched with the current custom notifier deliver their own events."""
+    route = os.environ.get("AGMUX_NOTIFY_CMD")
+    if not route:
+        return set()
+    fmt = "#{session_id}\t#{@agmux_pane}\t#{AGMUX_NOTIFY_CMD}"
+    owners = set()
+    for line in tmux.run("list-sessions", "-F", fmt, optional=True).splitlines():
+        fields = line.split("\t", 2)
+        if len(fields) == 3 and fields[1] and fields[2] == route:
+            owners.add(fields[0])
+    return owners
+
+
 def watch_command(tmux, interval, once=False, notify_enabled=True, existing=False):
     """Poll sessions and report when an agent starts waiting on the user."""
     previous = {}
@@ -3979,6 +4062,8 @@ def watch_command(tmux, interval, once=False, notify_enabled=True, existing=Fals
     while True:
         try:
             rows = tmux.session_details(detect=True)
+            if existing and tracked is None:
+                owners = existing_notification_owners(tmux) if notify_enabled else set()
         except Error as error:
             print(f"{APP}: {clean(error)}", file=sys.stderr)
             if once:
@@ -3989,8 +4074,8 @@ def watch_command(tmux, interval, once=False, notify_enabled=True, existing=Fals
             current = {(r["created"], r["id"]): r for r in rows
                        if r["agent"] and r["agent"] != "shell"}
             if tracked is None:
-                tracked = {key: (r["done_turn"], r["finished"]) for key, r in current.items()
-                           if not r["finished"] or r["status"] == "running"}
+                tracked = {key: WatchedCompletion(r) for key, r in current.items()
+                           if r["id"] not in owners and (not r["finished"] or r["status"] == "running")}
             tracked = {key: events for key, events in tracked.items() if key in current}
             if not tracked:
                 return 0
@@ -3999,19 +4084,18 @@ def watch_command(tmux, interval, once=False, notify_enabled=True, existing=Fals
             status = row_status(row)
             if existing:
                 key = (row["created"], row["id"])
-                done, finished = tracked[key]
-                tracked[key] = row["done_turn"], row["finished"]
-                label = AGENTS.get(row["agent"])
-                if row["finished"] and row["finished"] != finished:
+                watch = tracked[key]
+                agent = AGENTS.get(row["agent"])
+                label = agent.label if agent else "Agent"
+                if row["finished"] and row["finished"] != watch.exit_at:
                     del tracked[key]
                     code = row["exit_code"]
                     if notify_enabled:
-                        _run_notification(f"{label.label if label else 'Agent'} closed",
+                        _run_notification(f"{label} closed" if row["agent"] == "codex" else f"{label} finished",
                                           f"{row['name']} (exit {code})", row["name"],
                                           int(code) if re.fullmatch(r"-?[0-9]{1,4}", code) else -1)
-                elif (notify_enabled and row["done_turn"] and row["done_turn"] != done
-                      and status != "blocked"):
-                    _run_notification("Codex turn finished", row["name"], row["name"], 0)
+                elif watch.advanced(row, status) and notify_enabled:
+                    _run_notification(f"{label} turn finished", row["name"], row["name"], 0)
             notice, previous[row["id"]] = blocked_transition(
                 previous.get(row["id"]), status, row.get("prompt") or "waiting for input")
             if notice:
@@ -4102,6 +4186,8 @@ def build_parser():
     modes = discord.add_mutually_exclusive_group()
     modes.add_argument("--setup", action="store_true", help="save a webhook using a hidden prompt")
     modes.add_argument("--test", action="store_true", help="send a test notification")
+    discord.add_argument("--quiet-completions", action="store_true",
+                         help="silence successful completion alerts in Discord")
     discord.add_argument("title", nargs="?")
     discord.add_argument("session", nargs="?")
     discord.add_argument("exit_code", nargs="?", type=int)
@@ -4158,6 +4244,20 @@ def main(argv=None):
     args = parser.parse_args(args_list)
     if args.command == "discord":
         from agmux_discord import run
+        if args.test and args.title is None and os.environ.get("AGMUX_NOTIFY_CMD"):
+            try:
+                route = notification_argv(os.environ["AGMUX_NOTIFY_CMD"], "agmux completion test",
+                                          "Test session completed", "test session", 0)
+            except (ValueError, KeyError, IndexError):
+                raise Error("Invalid notify_cmd quoting or placeholder. Check your agmux config.") from None
+            if route[:2] == [APP, "discord"]:
+                delivery = parser.parse_args(route[1:])
+                if delivery.setup or delivery.test or delivery.session is None:
+                    raise Error("Discord notify_cmd must take an event title and session name.")
+                result = run(delivery, parser)
+                if result == 0:
+                    print("Discord accepted a completion test through the configured notification command.")
+                return result
         return run(args, parser)
     if args.command == "agents":
         for agent in AGENTS.values():
