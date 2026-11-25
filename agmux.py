@@ -4,7 +4,7 @@
 One standard-library Python file. agmux lists and manages tmux sessions, starts
 agent sessions (Codex, OpenCode, Claude Code, ...) or plain shells, flags
 sessions whose agent has finished, and shows what local provider usage data it
-can find. It never makes network requests and never reads credential files.
+can find. The optional Discord notifier can deliver alerts to your webhook.
 """
 
 import argparse
@@ -28,6 +28,7 @@ import textwrap
 import threading
 import time
 import unicodedata
+import uuid
 
 try:
     import sqlite3
@@ -36,7 +37,7 @@ except ImportError:  # pragma: no cover - sqlite3 is in the standard library
 
 
 APP = "agmux"
-VERSION = "0.8.1"
+VERSION = "0.9.1"
 SELF = Path(__file__).resolve()
 
 
@@ -575,14 +576,14 @@ def _compile_patterns(defaults, extra_env):
     return compiled
 
 
-def classify_screen(lines, limit=24, agent=None):
+def classify_screen(lines, limit=24, agent=None, title=""):
     """Return (state, prompt) where state is blocked, working, or idle.
 
     ``prompt`` is the screen line that looked like it needs the user. Passing
     the ``agent`` key enables that harness's own dialog fingerprints; generic
     patterns still apply to every agent.
     """
-    tail = [line.rstrip() for line in lines[-limit:] if line.strip()]
+    tail = [line.rstrip() for line in lines if line.strip()][-limit:]
     working = _compile_patterns(_WORKING_PATTERNS, "AGMUX_WORKING_PATTERNS")
     strong = _compile_patterns(_BLOCKED_STRONG, "AGMUX_BLOCKED_PATTERNS")
     weak = _compile_patterns(_BLOCKED_WEAK, None)
@@ -592,6 +593,27 @@ def classify_screen(lines, limit=24, agent=None):
     def is_working(line):
         return any(pattern.search(line) for pattern in working)
 
+    if agent == "codex":
+        # Use question headers and controls, including free-text and multi-page
+        # dialogs. A changing selection/footer is not a new question.
+        for index, line in reversed(list(enumerate(tail))):
+            if re.search(r"\bshift\s*\+\s*(?:left|←)\s+to answer\b", line, re.I):
+                return "blocked", line.strip()[:200]
+            if (re.match(r"^\s*[│┃]?\s*Question\s+\d+\s*(?:of|/)\s*\d+\b", line, re.I)
+                    and not any("Ask Codex to do anything" in s for s in tail[index + 1:])):
+                question = next((s.strip(" │┃") for s in tail[index + 1:]
+                                 if "?" in s and not _IDLE_COMPOSER.match(s)), "")
+                return "blocked", (question or line.strip())[:200]
+        if re.match(r"^\[\s*[!.]\s*\] Action Required\b", title, re.I):
+            question = next((s.strip(" │┃") for s in reversed(tail)
+                             if "?" in s and not _IDLE_COMPOSER.search(s)), "Codex needs input")
+            return "blocked", question[:200]
+        if _TITLE_ID.search(title) and not title.startswith("Ready | "):
+            if re.match(r"^(?:[⠀-⣿]\s+)?(?:Working|Thinking|Starting|Running)\b", title):
+                # Live approval widgets can coexist with a working indicator.
+                if not any(re.search(r"enter to (?:confirm|submit)|esc to (?:go back|dismiss)",
+                                     s, re.I) for s in tail):
+                    return "working", ""
     # 1. This agent's own dialogs: authoritative, and they beat live-work text.
     for line in reversed(tail):
         if any(pattern.search(line) for pattern in specific):
@@ -1196,6 +1218,8 @@ def validate_workspace(name, record):
         if not isinstance(record.get(key), str) or "\0" in record[key]:
             invalid()
     arguments = record.get("argv")
+    if not isinstance(record.get("history_file", ""), str) or "\0" in record.get("history_file", ""):
+        invalid()
     if (not isinstance(arguments, list)
             or not all(isinstance(arg, str) and "\0" not in arg for arg in arguments)):
         invalid()
@@ -1244,11 +1268,227 @@ def explicit_codex_resume(arguments):
     return ""
 
 
+_UUID = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+_RESUME = {"codex": ["resume"], "claude": ["--resume"], "opencode": ["--session"],
+           "gemini": ["--resume"], "crush": ["--session"],
+           "goose": ["session", "--resume", "--session-id"]}
+# Per-invocation OSC title. Codex renders this independently of terminal width.
+# The thread-id item can abbreviate the UUID even in a wide terminal.
+_CODEX_TITLE = 'tui.terminal_title=["activity","status","thread-title","thread-id"]'
+_TITLE_ID = re.compile(r"(?:^| \| )(" + _UUID +
+                       r"|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{2,11}(?:…|\.\.\.))$")
+
+
+def argument_id(agent, arguments):
+    if agent == "codex":
+        return explicit_codex_resume(arguments)
+    flags = {"claude": ("--session-id", "--resume", "-r"),
+             "gemini": ("--resume", "-r", "--session-id"), "goose": ("--session-id",),
+             "opencode": ("--session", "-s"), "crush": ("--session", "-s")}
+    if "--fork-session" in arguments or "--fork" in arguments:
+        return ""
+    for index, token in enumerate(arguments):
+        if token == "--":
+            break
+        key, sep, value = token.partition("=")
+        if key not in flags.get(agent, ()):
+            continue
+        if not sep:
+            value = arguments[index + 1] if index + 1 < len(arguments) else ""
+        pattern = {"claude": _UUID, "gemini": _UUID, "opencode": r"ses_[a-zA-Z0-9]+",
+                   "goose": r"[0-9]{8}_[0-9]+", "crush": _UUID}[agent]
+        if re.fullmatch(pattern, value):
+            return value
+    return ""
+
+
+def launch_arguments(agent, binary, arguments):
+    """Keep user argv literal. Only allocate IDs for ordinary new interactive sessions."""
+    if agent == "aider" and not arguments and recovery_enabled():
+        path = os.environ.get("AIDER_CHAT_HISTORY_FILE")
+        if not path:
+            directory = state_directory() / "aider-history"
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path = directory.resolve() / (str(uuid.uuid4()) + ".md")
+        return ["--chat-history-file", str(path)]
+    if agent not in ("claude", "gemini", "opencode"):
+        return list(arguments)
+    # Unknown options and subcommands pass through unchanged. In particular,
+    # never allocate a fresh ID for --continue, --resume, or --fork-session.
+    values = {"claude": {"--model", "--permission-mode", "--effort", "--agent"},
+              "opencode": {"--prompt", "--server"}, "gemini": {"--model", "-m", "-i"}}[agent]
+    switches = {"opencode": {"--standalone", "--auto"}}.get(agent, set())
+    index = 0
+    while index < len(arguments):
+        option, equal, _ = arguments[index].partition("=")
+        if option in values:
+            index += 1 if equal else 2
+        elif option in switches:
+            index += 1
+        else:
+            return list(arguments)
+    if agent == "claude":
+        return ["--session-id", str(uuid.uuid4()), *arguments]
+    # Older OpenCode releases accept --session only for an existing conversation.
+    try:
+        help_text = subprocess.run([binary, "--help"], capture_output=True, text=True,
+                                   timeout=3, errors="replace").stdout
+        if agent == "gemini" and "--session-id" in help_text:
+            return ["--session-id", str(uuid.uuid4()), *arguments]
+        if agent == "opencode" and "to create if it does not exist" in help_text:
+            return ["--session", "ses_" + uuid.uuid4().hex[:26], *arguments]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return list(arguments)
+
+
+def read_db(path, sql, args):
+    """Short read-only lookup. Unavailable or older schemas leave a fallback path."""
+    if sqlite3 is None or not path.is_file():
+        return []
+    try:
+        with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro",
+                                                uri=True, timeout=0.1)) as db:
+            return db.execute(sql, args).fetchall()
+    except (sqlite3.Error, OSError):
+        return []
+
+
+def codex_identity(title):
+    match = _TITLE_ID.search(title)
+    if not match:
+        return ""
+    prefix = match[1].rstrip(".…")
+    if re.fullmatch(_UUID, prefix):
+        return prefix
+    # A new, unnamed thread also publishes the complete ID in the thread-title field.
+    fields = title.split(" | ")
+    if len(fields) >= 3 and re.fullmatch(_UUID, fields[-2]) and fields[-2].startswith(prefix):
+        return fields[-2]
+    db = Path(os.environ.get("CODEX_SQLITE_HOME") or CODEX_HOME) / "state_5.sqlite"
+    matches = read_db(db, "SELECT id FROM threads WHERE id GLOB ? LIMIT 2", (prefix + "*",))
+    return matches[0][0] if len(matches) == 1 and re.fullmatch(_UUID, matches[0][0]) else ""
+
+
+def first_message(agent, identity):
+    if not identity:
+        return ""
+    if agent == "codex":
+        db = Path(os.environ.get("CODEX_SQLITE_HOME") or CODEX_HOME) / "state_5.sqlite"
+        rows = read_db(db, "SELECT first_user_message FROM threads WHERE id=?", (identity,))
+        return (rows[0][0] or "") if rows else ""
+    if agent == "opencode":
+        rows = read_db(OPENCODE_DB, "SELECT json_extract(data,'$.text') FROM session_message "
+                       "WHERE session_id=? AND type='user' ORDER BY seq LIMIT 1", (identity,))
+        if not rows:
+            rows = read_db(OPENCODE_DB, "SELECT json_extract(p.data,'$.text') FROM message m "
+                           "JOIN part p ON p.message_id=m.id WHERE m.session_id=? AND "
+                           "json_extract(m.data,'$.role')='user' AND json_extract(p.data,'$.type')="
+                           "'text' ORDER BY m.time_created,p.id LIMIT 1", (identity,))
+        return rows[0][0] if rows and isinstance(rows[0][0], str) else ""
+    if agent == "claude" and re.fullmatch(_UUID, identity):
+        projects = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+        for path in projects.glob("*/" + identity + ".jsonl"):
+            try:
+                with path.open(encoding="utf-8") as stream:
+                    for line in stream:
+                        item = json.loads(line)
+                        if item.get("type") != "user" or item.get("isMeta"):
+                            continue
+                        content = item.get("message", {}).get("content")
+                        if isinstance(content, str):
+                            return content
+                        if isinstance(content, list):
+                            words = [p["text"] for p in content if isinstance(p, dict)
+                                     and p.get("type") == "text" and isinstance(p.get("text"), str)]
+                            if words:
+                                return " ".join(words)
+            except (ValueError, AttributeError, OSError):
+                pass
+    return ""
+
+
+def codex_turn(identity):
+    if not re.fullmatch(_UUID, identity):
+        return ()
+    root = Path(os.environ.get("CODEX_SQLITE_HOME") or CODEX_HOME)
+    db = root / "thread_history_1.sqlite"
+    rows = read_db(db, "SELECT t.turn_id,t.status,t.started_at,"
+                   "substr(json_extract(i.item_json,'$.text'),-1000) FROM thread_turns t "
+                   "LEFT JOIN thread_items i ON i.thread_id=t.thread_id AND i.turn_id=t.turn_id "
+                   "AND i.item_id=t.final_agent_item_id WHERE t.thread_id=? "
+                   "ORDER BY t.rollout_ordinal DESC LIMIT 1", (identity,))
+    if not rows:
+        return ()
+    turn = rows[0]
+    if turn[1] == "completed" and read_db(root / "goals_1.sqlite",
+                                          "SELECT 1 FROM thread_goals WHERE thread_id=? "
+                                          "AND status='active' LIMIT 1", (identity,)):
+        return turn[0], "inProgress", turn[2], ""
+    return turn
+
+
+def agent_state(agent, lines, title, turn=()):
+    state, prompt = classify_screen(lines, agent=agent, title=title)
+    if agent == "codex" and turn and state != "blocked":
+        if turn[1] in ("inProgress", "in_progress"):
+            return "working", ""
+        if state == "idle" and turn[1] == "completed":
+            # A final, direct question is actionable even above an idle composer.
+            final = (turn[3] or "").strip()
+            if final.endswith("?"):
+                return "blocked", clean(final.splitlines()[-1])[-200:]
+    if agent == "codex" and state == "idle" and not turn:
+        # Older clients lack the turn index. Only the latest assistant block
+        # above a composer can be asking for a reply.
+        body = [line.strip() for line in trim_chrome("codex", lines) if line.strip()]
+        body = [line for line in body if not re.match(r"^Worked for \d", line)]
+        if body and body[-1].endswith("?") and any(_CODEX_COMPOSER.match(s.strip()) for s in lines):
+            marker = next((s[0] for s in reversed(body) if s.startswith(("• ", "› "))), "")
+            if marker == "•":
+                return "blocked", body[-1].lstrip("• ")[:200]
+    return state, prompt
+
+
 def recovery_launch(record, fresh=False):
     if fresh:
         return record["agent"], record["argv"]
-    if record["agent"] == "codex":
-        return "codex", ["resume"] + ([record["resume_id"]] if record["resume_id"] else [])
+    agent = record["agent"]
+    if agent == "aider":
+        if record.get("history_file"):
+            return agent, ["--chat-history-file", record["history_file"], "--restore-chat-history"]
+        for i, arg in enumerate(record["argv"]):
+            if arg == "--":
+                break
+            flag, sep, path = arg.partition("=")
+            if flag == "--chat-history-file":
+                if not sep and i + 1 < len(record["argv"]):
+                    path = record["argv"][i + 1]
+                if path and not path.startswith("-"):
+                    return agent, ["--chat-history-file", path, "--restore-chat-history"]
+    identity = record["resume_id"] or argument_id(agent, record["argv"])
+    if identity and agent in _RESUME:
+        args = [*_RESUME[agent], identity]
+        # A server or data-directory selector is part of the conversation address.
+        locations = {"codex": {"--remote", "--remote-auth-token-env", "--cd", "-C", "--profile", "-p"},
+                     "opencode": {"--server"}, "crush": {"--data-dir", "--cwd"}}.get(agent, set())
+        standalone = {"codex": "--no-daemon", "opencode": "--standalone"}.get(agent)
+        tokens = iter(record["argv"])
+        for token in tokens:
+            if token == "--":
+                break
+            key, sep, value = token.partition("=")
+            if token == standalone:
+                args.append(token)
+            elif key in locations:
+                value = value if sep else next(tokens, "")
+                if value and not value.startswith("-"):
+                    args.extend([key, value])
+            elif key in ("--prompt", "--model", "-m", "--config", "-c") and not sep:
+                next(tokens, None)
+        return agent, args
+    if agent in ("codex", "claude"):
+        return agent, list(_RESUME[agent])
     return "shell", []
 
 
@@ -1259,9 +1499,12 @@ def saved_rows(tmux, explicit=False):
     rows = []
     for name, record in tmux.workspace_store().read().items():
         if name not in live:
+            launcher, arguments = recovery_launch(record)
             rows.append(dict(id="saved:" + name, name=name, agent=record["agent"],
                              status="saved", activity=record["saved_at"],
                              windows=len(record["windows"]), attached=0, cwd=record["cwd"],
+                             resume_id=record["resume_id"] or argument_id(record["agent"], record["argv"]),
+                             resumes_chat=launcher != "shell" and len(arguments) > 1,
                              saved=True, process="", unread=0, cpu=0, rss=0))
     return sorted(rows, key=lambda row: (-row["activity"], row["name"]))
 
@@ -1305,7 +1548,7 @@ def workspace_saver(socket, directory, server):
 _SESSION_FIELDS = ("session_id", "session_name", "session_windows", "session_attached",
                    "session_activity", "session_created",
                    "@agmux_agent", "@agmux_status", "@agmux_unread", "@agmux_finished",
-                   "@agmux_pane")
+                   "@agmux_pane", "@agmux_exit", "@agmux_done_turn")
 
 
 class Tmux:
@@ -1355,21 +1598,23 @@ class Tmux:
                 return
             rows = self.sessions()
             metadata = {}
-            fmt = "#{session_id}\t#{@agmux_argv}\t#{@agmux_resume_id}\t#{@agmux_launch_cwd}"
+            fmt = ("#{session_id}\t#{@agmux_argv}\t#{@agmux_resume_id}\t#{@agmux_launch_cwd}"
+                   "\t#{@agmux_auto_name}\t#{@agmux_history_file}")
             for line in self.run("list-sessions", "-F", fmt, optional=True).splitlines():
-                fields = line.split("\t", 3)
-                if len(fields) == 4:
+                fields = line.split("\t", 5)
+                if len(fields) == 6:
                     metadata[fields[0]] = fields[1:]
             fields = ("session_id", "window_index", "window_name", "window_layout",
                       "window_width", "window_height", "window_active", "window_zoomed_flag",
-                      "pane_id", "pane_current_path", "pane_active")
+                      "pane_id", "pane_current_path", "pane_active", "pane_title")
             fmt = "\t".join("#{" + field + "}" for field in fields)
-            windows = {}
+            windows, titles = {}, {}
             for line in self.run("list-panes", "-a", "-F", fmt, optional=True).splitlines():
-                values = line.split("\t")
+                values = line.split("\t", len(fields) - 1)
                 if len(values) != len(fields):
                     raise Error("Cannot save workspace: unsupported control characters in tmux metadata.")
-                sid, index, name, layout, width, height, active, zoomed, pane, cwd, focus = values
+                sid, index, name, layout, width, height, active, zoomed, pane, cwd, focus, title = values
+                titles[pane] = title
                 group = windows.setdefault(sid, {})
                 window = group.setdefault(int(index), dict(
                     index=int(index), name=name, layout=layout, width=int(width), height=int(height),
@@ -1382,7 +1627,10 @@ class Tmux:
                 # tmux may have changed between queries. Never save an incomplete session.
                 if len(topology) != row["windows"]:
                     continue
-                raw, resume_id, launch_cwd = metadata.get(row["id"], ("[]", "", ""))
+                raw, resume_id, launch_cwd, auto_name, history_file = metadata.get(
+                    row["id"], ("[]", "", "", "", ""))
+                if row["agent"] == "codex":
+                    resume_id = codex_identity(titles.get(row["agent_pane"], "")) or resume_id
                 try:
                     argv = json.loads(raw or "[]")
                 except ValueError:
@@ -1391,9 +1639,11 @@ class Tmux:
                             for p in w["panes"] if p["active"]), topology[0]["panes"][0]["cwd"])
                 record = dict(agent=row["agent"] if row["agent"] in AGENTS else "shell",
                               cwd=(launch_cwd or cwd) if row["agent"] != "shell" else cwd,
-                              argv=argv, resume_id=resume_id,
+                              argv=argv, resume_id=resume_id, auto_name=auto_name == row["name"],
                               agent_pane=row.get("agent_pane") or "", windows=topology,
                               sid=row["id"], server=server, saved_at=time.time())
+                if history_file:
+                    record["history_file"] = history_file
                 try:
                     validate_workspace(row["name"], record)
                 except Error:
@@ -1457,6 +1707,11 @@ class Tmux:
                 raise Error(f"{profile.binary} is not on PATH. The saved workspace was kept.")
             if not profile.is_shell and not Path(record["cwd"]).is_dir():
                 raise Error(f"Saved agent directory does not exist: {clean(record['cwd'])}")
+            if fresh and not profile.is_shell:
+                arguments = launch_arguments(agent, shutil.which(profile.binary), arguments)
+            if (agent == "aider" and not fresh
+                    and not (Path(record["cwd"]) / Path(arguments[1]).expanduser()).is_file()):
+                raise Error(f"Saved Aider history file is missing: {clean(arguments[1])}")
             shell = os.environ.get("SHELL", "/bin/bash")
             if not Path(shell).is_file() or not os.access(shell, os.X_OK):
                 shell = "/bin/bash"
@@ -1501,11 +1756,16 @@ class Tmux:
                 self.session_option(sid, "agmux_status", "shell" if profile.is_shell else "running")
                 self.session_option(sid, "agmux_pane", tracked)
                 self.session_option(sid, "agmux_argv", json.dumps(record["argv"]))
-                self.session_option(sid, "agmux_resume_id", record["resume_id"])
+                identity = argument_id(agent, arguments) or ("" if fresh else record["resume_id"])
+                self.session_option(sid, "agmux_resume_id", identity)
+                if agent == "aider" and arguments[:1] == ["--chat-history-file"] and len(arguments) > 1:
+                    self.session_option(sid, "agmux_history_file", arguments[1])
+                if record.get("auto_name") is True:
+                    self.session_option(sid, "agmux_auto_name", name)
                 self.session_option(sid, "agmux_launch_cwd", record["cwd"])
                 if not profile.is_shell:
                     self.run("respawn-pane", "-k", "-t", tracked, "-c", record["cwd"],
-                             sys.executable, str(SELF), "_launch", "--agent", agent,
+                             *self.agent_environment(), sys.executable, str(SELF), "_launch", "--agent", agent,
                              "--bin", shutil.which(profile.binary), "--shell", shell,
                              "--session", name, "--notify" if notify else "--no-notify",
                              "--argv", json.dumps(arguments))
@@ -1529,12 +1789,12 @@ class Tmux:
             if len(fields) != len(_SESSION_FIELDS):
                 continue
             (sid, name, windows, attached, activity, created,
-             agent, status, unread, finished, agent_pane) = fields
+             agent, status, unread, finished, agent_pane, exit_code, done_turn) = fields
             rows.append(dict(id=sid, name=name, windows=int(windows), attached=int(attached),
                              activity=int(activity or 0), created=int(created or 0),
                              agent=agent or "", status=status or "",
                              unread=int(unread or 0), finished=int(finished or 0),
-                             agent_pane=agent_pane or ""))
+                             agent_pane=agent_pane or "", exit_code=exit_code, done_turn=done_turn))
         return sorted(rows, key=lambda row: (-row["activity"], row["name"]))
 
     def session_details(self, detect=False, resources=False):
@@ -1543,14 +1803,16 @@ class Tmux:
             return []
         fmt = "\t".join("#{" + key + "}" for key in
                         ("session_id", "window_active", "pane_active",
-                         "pane_current_command", "pane_current_path", "pane_id"))
+                         "pane_current_command", "pane_current_path", "pane_id", "pane_title",
+                         "@agmux_resume_id"))
         panes, active = {}, {}
         for line in self.run("list-panes", "-a", "-F", fmt, optional=True).splitlines():
-            fields = line.split("\t", 5)
-            if len(fields) != 6:
+            fields = line.split("\t")
+            if len(fields) != 8:
                 continue
-            session_id, window_active, pane_active, process, cwd, pane = fields
+            session_id, window_active, pane_active, process, cwd, pane, title, identity = fields
             entry = dict(session=session_id, process=process, cwd=cwd, pane=pane,
+                         title=title, identity=identity,
                          active=window_active == "1" and pane_active == "1")
             panes[pane] = entry
             if entry["active"]:
@@ -1573,10 +1835,17 @@ class Tmux:
             if not state or state["session"] != row["id"]:
                 state = panes.get(row["pane"])
             if (detect and row["agent"] and row["agent"] != "shell" and state
-                    and state["process"] not in SHELL_COMMANDS):
+                    and (state["process"] not in SHELL_COMMANDS
+                         or (row["status"] == "running" and state["pane"] == row["agent_pane"]))):
                 try:
-                    state_name, prompt = classify_screen(self.pane_lines(state["pane"]),
-                                                         agent=row["agent"])
+                    turn = () if row["agent"] != "codex" else codex_turn(
+                        codex_identity(state["title"]) or
+                        (state["identity"] if row["status"] == "running" else ""))
+                    state_name, prompt = agent_state(row["agent"], self.visible_lines(state["pane"]),
+                                                     state["title"], turn)
+                    if (row["status"] == "running" and row["done_turn"] and
+                            (not turn or turn[:2] != (row["done_turn"], "completed"))):
+                        row["unread"] = 0
                 except Error:
                     state_name, prompt = "", ""
                 row["state"], row["prompt"] = state_name, prompt
@@ -1611,6 +1880,9 @@ class Tmux:
         """
         return self.run("capture-pane", "-p", "-t", target, "-S", f"-{lines}",
                         "-E", "-").splitlines()
+
+    def visible_lines(self, pane):
+        return self.run("capture-pane", "-p", "-t", pane, "-S", "0", "-E", "-").splitlines()
 
     def resolve(self, target):
         rows = self.sessions()
@@ -1716,6 +1988,17 @@ class Tmux:
     def session_option(self, sid, name, value):
         self.run("set-option", "-t", sid, "@" + name, str(value))
 
+    def agent_environment(self):
+        # An existing tmux server may have been started from another shell.
+        values = {"AGMUX_STATE_DIR": str(state_directory().resolve()),
+                  "AGMUX_PERSIST": "1" if recovery_enabled() else "0"}
+        for key in ("AGMUX_CONFIG", "XDG_CONFIG_HOME", "AGMUX_NOTIFY_CMD", "AGMUX_WATCH_INTERVAL",
+                    "AGMUX_BLOCKED_PATTERNS", "AGMUX_WORKING_PATTERNS", "CODEX_HOME",
+                    "CODEX_SQLITE_HOME", "OPENCODE_DATA_DIR", "CLAUDE_CONFIG_DIR"):
+            if key in os.environ:
+                values[key] = os.environ[key]
+        return [arg for key, value in values.items() for arg in ("-e", f"{key}={value}")]
+
     def mark_read(self, sid):
         """Clear the unread/finished badge once the user has looked at a session.
 
@@ -1725,7 +2008,7 @@ class Tmux:
         """
         try:
             self.session_option(sid, "agmux_unread", "0")
-            if any(row["id"] == sid and row["status"] == "finished"
+            if any(row["id"] == sid and row["status"] in ("finished", "exited")
                    for row in self.sessions()):
                 self.session_option(sid, "agmux_status", "idle")
         except Error:
@@ -1744,7 +2027,8 @@ class Tmux:
             if mode == "1":
                 self.run("send-keys", "-t", pane, "-X", "cancel", optional=True)
 
-    def create(self, name, cwd, agent=DEFAULT_AGENT, agent_args=(), notify=True):
+    def create(self, name, cwd, agent=DEFAULT_AGENT, agent_args=(), notify=True, auto_name=False,
+               remember_agent=False):
         validate_name(name)
         profile = AGENTS.get(agent)
         if profile is None:
@@ -1756,29 +2040,39 @@ class Tmux:
             raise Error(f"Session {name!r} already exists. Use {APP} attach {shlex.quote(name)}")
         args = ["new-session", "-d", "-s", name, "-c", str(directory),
                 "-P", "-F", "#{session_id}"]
+        actual = agent_args
         if not profile.is_shell:
             binary = shutil.which(profile.binary)
             if not binary:
                 raise Error(f"{profile.binary} is not on PATH. Use --agent shell for a plain session.")
+            actual = launch_arguments(agent, binary, agent_args)
             user_shell = os.environ.get("SHELL", "/bin/bash")
             if not Path(user_shell).is_file() or not os.access(user_shell, os.X_OK):
                 user_shell = "/bin/bash"
             # tmux executes this argv directly. JSON is one literal argument, even
             # when agent arguments contain tmux separators or shell metacharacters.
-            args += [sys.executable, str(SELF), "_launch",
+            args += [*self.agent_environment(), sys.executable, str(SELF), "_launch",
                      "--agent", profile.key, "--bin", binary, "--shell", user_shell,
                      "--session", name, "--notify" if notify else "--no-notify",
-                     "--argv", json.dumps(list(agent_args))]
+                     "--argv", json.dumps(list(actual))]
+        # Seed pre-upgrade usage before the new session is visible to the saver.
+        project_history(self)
         sid = self.run(*args)
+        project_history(self, cwd=str(directory), selected_agent=agent if remember_agent else None)
         try:
             self.session_option(sid, "agmux_agent", profile.key)
-            self.session_option(sid, "agmux_status", "shell" if profile.is_shell else "running")
+            if profile.is_shell:
+                self.session_option(sid, "agmux_status", "shell")
+            if auto_name and not profile.is_shell:
+                self.session_option(sid, "agmux_auto_name", name)
             self.session_option(sid, "agmux_started", str(int(time.time())))
             self.session_option(sid, "agmux_argv", json.dumps(list(agent_args)))
             self.session_option(sid, "agmux_launch_cwd", str(directory))
-            resume_id = explicit_codex_resume(agent_args) if agent == "codex" else ""
+            resume_id = argument_id(agent, actual)
             if resume_id:
                 self.session_option(sid, "agmux_resume_id", resume_id)
+            if agent == "aider" and not agent_args and actual:
+                self.session_option(sid, "agmux_history_file", actual[1])
         except Error:
             pass
         self.autosave()
@@ -1787,7 +2081,36 @@ class Tmux:
     def rename(self, sid, name):
         validate_name(name)
         self.run("rename-session", "-t", sid, name)
+        self.session_option(sid, "agmux_auto_name", "")
         self.autosave()
+
+    def suggested_name(self, cwd, agent):
+        rows = self.sessions()
+        if recovery_enabled():
+            try:
+                rows.extend({"name": name} for name in self.workspace_store().read())
+            except (Error, OSError):
+                pass  # The caller can still create a live session when saving is unavailable.
+        return default_name(cwd, rows, agent)
+
+    def name_from_message(self, sid, placeholder, message):
+        # Target the original name so a concurrent manual rename wins.
+        printable = clean(message[:256]).translate(str.maketrans(".:;#\\", "     "))
+        base = " ".join(printable.split())[:48].rstrip()
+        if not base:
+            return False
+        rows = self.sessions()
+        if not any(r["id"] == sid and r["name"] == placeholder for r in rows):
+            return False
+        used = {r["name"] for r in rows}
+        if recovery_enabled():
+            used.update(self.workspace_store().read())
+        name, suffix = base, 2
+        while name in used and name != placeholder:
+            name, suffix = f"{base} {suffix}", suffix + 1
+        self.run("rename-session", "-t", "=" + placeholder, "--", name)
+        self.session_option(sid, "agmux_auto_name", "")
+        return True
 
     def active_pane(self, sid):
         """Command and working directory of a session's current pane."""
@@ -1956,17 +2279,17 @@ def row_status(row):
     """
     if row.get("saved"):
         return "saved"
-    if row.get("unread"):
-        return "finished"
     status = row.get("status")
     state = row.get("state")
     agent = row.get("agent")
-    if status == "finished":
-        return "finished"
     if state == "blocked":
         return "blocked"
     if state == "working":
         return "running"
+    if status == "exited":
+        return "exited"
+    if row.get("unread") or status == "finished":
+        return "finished"
     if state == "idle":
         return "idle" if agent and agent != "shell" else "shell"
     if status in ("idle", "read"):
@@ -2005,8 +2328,11 @@ def _run_notification(title, body, session, exit_code=-1):
         try:
             parts = [part.format(title=title, body=body, session=session,
                                  exit_code=exit_code) for part in shlex.split(custom)]
+            if parts[:2] == [APP, "discord"]:
+                parts[:1] = [sys.executable, str(SELF)]
             if parts:
-                subprocess.Popen(parts, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen(parts, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return
         except (ValueError, OSError, KeyError, IndexError):
             pass
@@ -2036,7 +2362,8 @@ def send_blocked_notification(label, session, prompt, enabled=True):
 
 def watch_interval():
     try:
-        return max(1.0, float(os.environ.get("AGMUX_WATCH_INTERVAL", "3") or 3))
+        interval = float(os.environ.get("AGMUX_WATCH_INTERVAL", "3") or 3)
+        return max(1.0, interval) if math.isfinite(interval) else 3.0
     except ValueError:
         return 3.0
 
@@ -2055,18 +2382,84 @@ def blocked_transition(previous_prompt, state, prompt):
     return None, previous_prompt
 
 
-def watch_blocked(tmux, target, label, session, stop_event, interval, agent=None):
-    """While an agent runs, poll its pane and notify on a new blocked prompt."""
-    last_prompt = None
-    while not stop_event.wait(interval):
-        try:
-            lines = tmux.pane_lines(target)
-        except Error:
+def submitted_screen_message(agent, lines):
+    """Fallback for harnesses without a readable message store. Require a later reply
+    or a second composer, so the current draft never becomes a session name."""
+    prefixes = {"codex": "›", "claude": "❯", "gemini": ">", "aider": ">",
+                "opencode": ">", "goose": "❯", "crush": ">"}
+    marker = prefixes.get(agent)
+    if not marker:
+        return ""
+    for index, line in enumerate(lines):
+        text = line.strip()
+        if not text.startswith(marker + " "):
             continue
-        state, prompt = classify_screen(lines, agent=agent)
-        notice, last_prompt = blocked_transition(last_prompt, state, prompt)
-        if notice:
-            send_blocked_notification(label, session, notice)
+        prompt = text[2:].strip()
+        if not prompt or re.match(r"\d+[.)]\s|Ask Codex\b|Type your message\b", prompt, re.I):
+            continue
+        later_lines = [later.strip() for later in lines[index + 1:]]
+        if any(later == marker or later.startswith(marker + " ") for later in later_lines):
+            return prompt
+        if agent != "codex" and any(re.match(r"^[•⏺✦]\s", later) for later in later_lines):
+            return prompt
+    return ""
+
+
+def monitor_agent(tmux, sid, pane, profile, stop, started, notify, previous_turn=""):
+    last_prompt = None
+    pending_done, announced = "", previous_turn
+    unread = False
+    needs_checkpoint = False
+    while not stop.is_set():
+        try:
+            metadata = tmux.run("display-message", "-p", "-t", pane,
+                                "#{session_name}\t#{@agmux_auto_name}\t#{@agmux_resume_id}\t#{pane_title}")
+            name, placeholder, identity, title = metadata.split("\t", 3)
+            lines = tmux.visible_lines(pane)
+            current = ""
+            if profile.key == "codex":
+                current = codex_identity(title)
+            elif profile.key == "goose" and not identity:
+                banner = re.search(r"(?im)^\s*session id:\s*(\d{8}_\d+)\s*$", "\n".join(lines))
+                current = banner[1] if banner else ""
+            if current and current != identity:
+                identity = current
+                tmux.session_option(sid, "agmux_resume_id", identity)
+                needs_checkpoint = True
+            if placeholder and placeholder == name:
+                message = first_message(profile.key, identity)
+                if not message:
+                    message = submitted_screen_message(profile.key, lines)
+                if message and tmux.name_from_message(sid, name, message):
+                    needs_checkpoint = True
+                    name = tmux.run("display-message", "-p", "-t", pane, "#{session_name}")
+            if needs_checkpoint and recovery_enabled():
+                tmux.checkpoint()
+                needs_checkpoint = False
+            turn = codex_turn(identity) if profile.key == "codex" else ()
+            state, prompt = agent_state(profile.key, lines, title, turn)
+            notice, last_prompt = blocked_transition(last_prompt, state, prompt)
+            if notice:
+                send_blocked_notification(profile.label, name, notice, notify)
+            # A quiet repaint, tool result or interrupted turn cannot finish a chat.
+            # Require a completed turn from this launch and two ready samples.
+            done = (turn[0] if state == "idle" and title.startswith("Ready | ")
+                    and turn and turn[1] == "completed" and isinstance(turn[2], (int, float))
+                    and turn[2] >= int(started) else "")
+            if done and done == pending_done and done != announced:
+                tmux.session_option(sid, "agmux_done_turn", done)
+                tmux.session_option(sid, "agmux_unread", "1")
+                if notify:
+                    _run_notification("Codex turn finished", name, name, 0)
+                announced = done
+                unread = True
+            elif unread and (state != "idle" or (turn and turn[0] != announced)):
+                tmux.session_option(sid, "agmux_unread", "0")
+                unread = False
+            pending_done = done
+        except (Error, OSError, ValueError):
+            pass
+        stop.wait(watch_interval())
 
 
 def launch_agent(agent_key, executable, shell, session, arguments, notify_enabled):
@@ -2080,7 +2473,7 @@ def launch_agent(agent_key, executable, shell, session, arguments, notify_enable
     tmux = None
     sid = None
     try:
-        tmux = Tmux()
+        tmux = Tmux(os.environ.get("TMUX", "").partition(",")[0] or None)
         sid = tmux.current_session_id()
     except Error:
         pass
@@ -2103,13 +2496,17 @@ def launch_agent(agent_key, executable, shell, session, arguments, notify_enable
     started = time.time()
     code = 0
     stop_event = threading.Event()
-    if tmux and sid and notify_enabled:
-        target = pane or f"{sid}:"
-        threading.Thread(target=watch_blocked,
-                         args=(tmux, target, profile.label, session, stop_event,
-                               watch_interval(), profile.key), daemon=True).start()
+    watcher = None
     try:
-        child = subprocess.Popen([executable, *arguments])
+        actual = (["-c", _CODEX_TITLE, *arguments]
+                  if tmux and sid and agent_key == "codex" else arguments)
+        prior = codex_turn(explicit_codex_resume(arguments)) if agent_key == "codex" else ()
+        child = subprocess.Popen([executable, *actual])
+        if tmux and sid and pane:
+            watcher = threading.Thread(target=monitor_agent, args=(
+                tmux, sid, pane, profile, stop_event, started, notify_enabled,
+                prior[0] if prior else ""), daemon=True)
+            watcher.start()
         while True:
             try:
                 child.wait()
@@ -2123,31 +2520,43 @@ def launch_agent(agent_key, executable, shell, session, arguments, notify_enable
         print(f"{APP}: {clean(error)}", file=sys.stderr)
         code = 127
     stop_event.set()
-    if tmux and pane and agent_key == "codex":
+    if watcher:
+        watcher.join()
+    if tmux and pane and agent_key in ("codex", "opencode", "crush"):
         try:
-            output = "\n".join(tmux.pane_lines(pane, 80))
-            # A narrow terminal may wrap the ID: never save a truncated prefix.
-            matches = re.findall(
-                r"To continue this session, run codex resume "
-                r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?![a-zA-Z0-9_-])", output)
+            output = tmux.run("capture-pane", "-J", "-p", "-t", pane, "-S", "-80", "-E", "-")
+            pattern = {"codex": r"To continue this session, run codex resume (" + _UUID + ")",
+                       "opencode": r"^\s*opencode (?:-s|--session) (ses_[A-Za-z0-9]+)",
+                       "crush": r"\bcrush (?:-s|--session) (" + _UUID + ")"}[agent_key]
+            matches = re.findall(pattern + r"(?![a-zA-Z0-9_-])", output, re.M)
             if matches:
                 set_option("agmux_resume_id", matches[-1])
         except Error:
             pass
 
     elapsed = time.time() - started
-    set_option("agmux_status", "finished")
+    set_option("agmux_status", "exited" if agent_key == "codex" else "finished")
     set_option("agmux_exit", str(code))
     set_option("agmux_finished", str(int(time.time())))
     set_option("agmux_duration", str(int(elapsed)))
     set_option("agmux_unread", "1")
 
-    send_notification(profile.label, session, code, elapsed, notify_enabled)
-    if tmux and sid:
+    if tmux and pane:
+        try:
+            session = tmux.run("display-message", "-p", "-t", pane, "#{session_name}") or session
+            if recovery_enabled():
+                tmux.checkpoint()
+        except (Error, OSError):
+            pass
+    if agent_key == "codex":
+        if notify_enabled:
+            _run_notification("Codex closed", f"{session} (exit {code})", session, code)
+    else:
+        send_notification(profile.label, session, code, elapsed, notify_enabled)
+    if tmux and sid and notify_enabled:
         try:
             tmux.run("display-message", "-d", "8000",
-                     f"{APP}: {profile.label} finished in {session} "
+                     f"{APP}: {profile.label} exited in {session} "
                      f"({humanize_delta(elapsed)})", optional=True)
         except Error:
             pass
@@ -2650,12 +3059,12 @@ HELP_SECTIONS = (
         ("", "Finished sessions get a check mark and a notification."),
         ("", "Closed and post-reboot sessions live in the History tab (Right arrow),"),
         ("", "not on the main page. Enter there restores windows and panes."),
-        ("", "Codex opens saved history; other agents restore to shells by default."),
+        ("", "Supported agents reopen their saved conversation when its ID is known."),
         ("", "cpu X% and mem Y are this machine's CPU and RAM for the session's"),
         ("", "processes, not token, context-window, or rate-limit usage."),
         ("", "Deleting ends the session and its programs; files on disk are"),
         ("", "untouched. Previews and the viewer keep the pane's own colors."),
-        ("", "Everything is read locally: no telemetry and no network requests."),
+        ("", "Usage and previews are local, with no telemetry. Discord alerts are optional."),
     )),
 )
 
@@ -2907,6 +3316,9 @@ def choose(screen, title, options, style, hint="Type to filter | Up/Down select 
     while True:
         matches = [o for o in options
                    if fuzzy(query, o["label"] + " " + o.get("note", ""))]
+        if paths and query:
+            term = query.casefold()
+            matches.sort(key=lambda o: term not in o["label"].casefold())
         if paths and query[:1] in ("/", "~", "."):
             typed = os.path.abspath(os.path.expanduser(query))
             if os.path.isdir(typed):
@@ -2962,43 +3374,86 @@ def choose(screen, title, options, style, hint="Type to filter | Up/Down select 
             query += key
 
 
-def _recent_file():
-    return state_directory() / "recent.json"
-
-
-def load_recent():
-    """Last agent and recently used directories (best effort, never raises)."""
+def _read_project_history(path, tmux):
     try:
-        data = json.loads(_recent_file().read_text())
-        agent = data.get("agent") if isinstance(data.get("agent"), str) else ""
-        dirs = [d for d in data.get("dirs", []) if isinstance(d, str)][:8]
-        return agent, dirs
-    except (OSError, ValueError, AttributeError):
-        return "", []
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    agent = data.get("agent") if isinstance(data.get("agent"), str) else ""
+    if isinstance(data.get("projects"), list):
+        # The file stores ordered pairs. Insertion order breaks frequency ties.
+        uses = {}
+        for item in data["projects"]:
+            if (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)
+                    and os.path.isabs(item[0]) and "\0" not in item[0]
+                    and type(item[1]) is int and item[1] > 0):
+                uses[item[0]] = item[1]
+        return agent, uses, False
+
+    # Old releases kept eight recent paths but no counts. Each saved workspace
+    # supplies one observed use; a recent path may already be represented there.
+    counts = {}
+    if recovery_enabled():
+        try:
+            for record in tmux.workspace_store().read().values():
+                directory = record["cwd"]
+                if os.path.isabs(directory):
+                    directory = os.path.realpath(directory)
+                    counts[directory] = counts.get(directory, 0) + 1
+        except (Error, OSError):
+            pass
+    uses = {}
+    recent = data.get("dirs")
+    if isinstance(recent, list):
+        for directory in recent:
+            if isinstance(directory, str) and os.path.isabs(directory) and "\0" not in directory:
+                directory = os.path.realpath(directory)
+                if directory not in uses:
+                    uses[directory] = counts.pop(directory, 1)
+    # Saved checkpoints carry no reliable last-selection time.
+    for directory in sorted(counts, key=lambda d: (Path(d).name.casefold(), d)):
+        uses[directory] = counts[directory]
+    return agent, uses, True
 
 
-def remember_recent(agent, cwd):
-    agent_old, dirs = load_recent()
-    dirs = [cwd] + [d for d in dirs if d != cwd]
+def project_history(tmux, cwd=None, selected_agent=None):
+    """Return last agent and use counts in most-recent-first order."""
+    path = state_directory() / "recent.json"
+    agent, uses, migrate = _read_project_history(path, tmux)
+    if not migrate and cwd is None:
+        return agent, uses
     try:
-        path = _recent_file()
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        tmp = path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            json.dump({"agent": agent, "dirs": dirs[:8]}, handle)
-        os.replace(tmp, path)
+        fd = os.open(path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(fd, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            agent, uses, migrate = _read_project_history(path, tmux)
+            if cwd is not None:
+                agent = selected_agent or agent
+                count = uses.pop(cwd, 0)
+                uses = {cwd: count + 1, **uses}
+            if migrate or cwd is not None:
+                fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".recent-")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        json.dump({"agent": agent, "projects": list(uses.items())}, handle)
+                    os.replace(tmp, path)
+                finally:
+                    Path(tmp).unlink(missing_ok=True)
     except OSError:
-        pass
+        pass  # Picker preferences are optional, including on a read-only filesystem.
+    return agent, uses
 
 
 def new_session_flow(screen, tmux, style, notify=True, name=None):
     """Ctrl-N wizard: agent, then directory, then an optional name.
 
-    The last agent and recent directories float to the top, a typed path is
+    The last agent and frequently selected directories float to the top, a typed path is
     accepted directly, and a blank name means "use the suggestion".
     """
-    last_agent, recent_dirs = load_recent()
+    last_agent, uses = project_history(tmux)
     options = []
     for agent in AGENTS.values():
         if agent.is_shell:
@@ -3017,13 +3472,18 @@ def new_session_flow(screen, tmux, style, notify=True, name=None):
     directories, seen = [], set()
 
     def add(label, note, value):
-        if value not in seen and Path(value).is_dir():
-            seen.add(value)
-            directories.append(dict(label=label, note=note, value=value))
+        path = Path(value)
+        if path.is_dir():
+            canonical = str(path.resolve())
+            if canonical not in seen:
+                seen.add(canonical)
+                directories.append(dict(label=label, note=note, value=canonical))
 
+    for directory in sorted(uses, key=uses.get, reverse=True):
+        count = uses[directory]
+        label = "~" if directory == str(Path.home()) else Path(directory).name or directory
+        add(label, f"{count} session{'s' if count != 1 else ''}  {short_path(directory)}", directory)
     add(str(Path.cwd()), "current directory", str(Path.cwd()))
-    for directory in recent_dirs:
-        add(short_path(directory), "recent", directory)
     try:
         for repo in repos():
             add(repo["name"], short_path(repo["id"]), repo["id"])
@@ -3036,14 +3496,15 @@ def new_session_flow(screen, tmux, style, notify=True, name=None):
     if cwd is None:
         return None
 
-    suggestion = default_name(cwd, tmux.sessions(), agent)
+    suggestion = tmux.suggested_name(cwd, agent)
+    auto_name = False
     if name is None:
         name = prompt(screen, "Name (3/3)", "", style, placeholder=suggestion + "  (Enter = use this)")
         if name is None:
             return None
+        auto_name = not name.strip()
         name = name.strip() or suggestion
-    sid = tmux.create(name, cwd, agent=agent, notify=notify)
-    remember_recent(agent, cwd)
+    sid = tmux.create(name, cwd, agent=agent, notify=notify, auto_name=auto_name, remember_agent=True)
     return dict(id=sid, name=name)
 
 
@@ -3175,9 +3636,12 @@ def picker(screen, tmux, show_preview=True, style=None, notify=True, resources=T
                                 followed = tmux.follow_preview(selected_id, origin_client)
                             follow_key = selected_id
                         if selected.get("saved"):
-                            detail = ("Codex will open its saved conversation history."
-                                      if selected["agent"] == "codex" else
-                                      "Restores shell panes; start the agent when ready.")
+                            if selected.get("resumes_chat"):
+                                detail = f"Resumes this {AGENTS[selected['agent']].label} conversation."
+                            elif selected["agent"] in ("codex", "claude"):
+                                detail = "No conversation ID was saved. Choose the chat in the agent's history."
+                            else:
+                                detail = "Restores shell panes; start the agent when ready."
                             lines = ["Saved workspace | " + short_path(selected["cwd"]), "",
                                      "Enter restores windows, panes, layouts, and directories.", detail,
                                      "Ctrl-D forgets this saved workspace."]
@@ -3432,8 +3896,8 @@ def list_line(row, enabled):
         segments.append(("  " + resource, "secondary"))
     if status == "blocked" and row.get("prompt"):
         segments.append(("  needs input: " + row["prompt"][:100], "warning"))
-    elif status == "finished":
-        segments.append(("  finished", "finished"))
+    elif status in ("finished", "exited"):
+        segments.append(("  " + status, "finished" if status == "finished" else "muted"))
     return paint_segments(segments, enabled)
 
 
@@ -3508,25 +3972,54 @@ def doctor(tmux):
           f"{statuses.count('finished')} finished)")
 
 
-def watch_command(tmux, interval, once=False, notify_enabled=True):
+def watch_command(tmux, interval, once=False, notify_enabled=True, existing=False):
     """Poll sessions and report when an agent starts waiting on the user."""
     previous = {}
+    tracked = None
     while True:
         try:
             rows = tmux.session_details(detect=True)
         except Error as error:
             print(f"{APP}: {clean(error)}", file=sys.stderr)
-            rows = []
+            if once:
+                return 1
+            time.sleep(interval)
+            continue
+        if existing:
+            current = {(r["created"], r["id"]): r for r in rows
+                       if r["agent"] and r["agent"] != "shell"}
+            if tracked is None:
+                tracked = {key: (r["done_turn"], r["finished"]) for key, r in current.items()
+                           if not r["finished"] or r["status"] == "running"}
+            tracked = {key: events for key, events in tracked.items() if key in current}
+            if not tracked:
+                return 0
+            rows = [current[key] for key in tracked]
         for row in rows:
             status = row_status(row)
-            if status == "blocked" and previous.get(row["id"]) != "blocked":
+            if existing:
+                key = (row["created"], row["id"])
+                done, finished = tracked[key]
+                tracked[key] = row["done_turn"], row["finished"]
+                label = AGENTS.get(row["agent"])
+                if row["finished"] and row["finished"] != finished:
+                    del tracked[key]
+                    code = row["exit_code"]
+                    if notify_enabled:
+                        _run_notification(f"{label.label if label else 'Agent'} closed",
+                                          f"{row['name']} (exit {code})", row["name"],
+                                          int(code) if re.fullmatch(r"-?[0-9]{1,4}", code) else -1)
+                elif (notify_enabled and row["done_turn"] and row["done_turn"] != done
+                      and status != "blocked"):
+                    _run_notification("Codex turn finished", row["name"], row["name"], 0)
+            notice, previous[row["id"]] = blocked_transition(
+                previous.get(row["id"]), status, row.get("prompt") or "waiting for input")
+            if notice:
                 agent = AGENTS.get(row.get("agent") or "")
                 label = agent.label if agent and not agent.is_shell \
                     else (row.get("process") or "agent")
-                prompt = row.get("prompt") or "waiting for input"
-                print(f"{clean(row['name'])}: {clean(label)} needs input - {clean(prompt)}")
-                send_blocked_notification(label, row["name"], prompt, notify_enabled)
-            previous[row["id"]] = status
+                print(f"{clean(row['name'])}: {clean(label)} needs input - {clean(notice)}")
+                send_blocked_notification(label, row["name"], notice, notify_enabled)
         if once:
             return 0
         time.sleep(interval)
@@ -3537,7 +4030,7 @@ def build_parser():
     parser.add_argument("--version", action="version", version=f"{APP} {VERSION}")
     parser.add_argument("--no-preview", action="store_true",
                         help="start with pane previews hidden")
-    parser.add_argument("--no-notify", action="store_true",
+    parser.add_argument("--no-notify", action="store_true", default=not notify_default(),
                         help="do not send a notification when an agent finishes")
     parser.add_argument("--no-resources", action="store_true",
                         help="do not sample per-session CPU and memory")
@@ -3573,7 +4066,7 @@ def build_parser():
     attach = sub.add_parser("attach", help="attach outside tmux; switch inside it")
     attach.add_argument("session")
     new = sub.add_parser("new", help="start an agent or shell in a named session")
-    new.add_argument("name")
+    new.add_argument("name", nargs="?", help="omit to name the session from its first message")
     new.add_argument("--agent", default=DEFAULT_AGENT,
                      help=f"agent to run (default: {DEFAULT_AGENT}); 'shell' for a plain session")
     new.add_argument("--cwd", default=str(Path.cwd()))
@@ -3601,8 +4094,17 @@ def build_parser():
     watch.add_argument("--interval", type=float, default=watch_interval(),
                        help="seconds between checks (default: %(default)s)")
     watch.add_argument("--once", action="store_true", help="check once and exit")
+    watch.add_argument("--existing", action="store_true",
+                       help="watch only agents open now, including newly recorded completions, then exit")
     watch.add_argument("--no-notify", action="store_true", default=argparse.SUPPRESS,
                        help="print changes without desktop notifications")
+    discord = sub.add_parser("discord", help="configure or test outgoing Discord alerts")
+    modes = discord.add_mutually_exclusive_group()
+    modes.add_argument("--setup", action="store_true", help="save a webhook using a hidden prompt")
+    modes.add_argument("--test", action="store_true", help="send a test notification")
+    discord.add_argument("title", nargs="?")
+    discord.add_argument("session", nargs="?")
+    discord.add_argument("exit_code", nargs="?", type=int)
     preview = sub.add_parser("preview", help="show recent output from the active pane")
     preview.add_argument("session")
     peek = sub.add_parser("peek", help="read-only live output viewer without attaching")
@@ -3654,6 +4156,9 @@ def main(argv=None):
         divider = args_list.index("--", index)
         agent_args, args_list = args_list[divider + 1:], args_list[:divider]
     args = parser.parse_args(args_list)
+    if args.command == "discord":
+        from agmux_discord import run
+        return run(args, parser)
     if args.command == "agents":
         for agent in AGENTS.values():
             if agent.is_shell:
@@ -3747,8 +4252,11 @@ def main(argv=None):
         if not args.detach and not os.environ.get("TMUX") and not sys.stdin.isatty():
             raise Error("Use --detach when creating a session without a terminal.")
         client = tmux.client() if not args.detach and os.environ.get("TMUX") else None
+        auto_name = args.name is None
+        if auto_name:
+            args.name = tmux.suggested_name(args.cwd, args.agent)
         sid = tmux.create(args.name, args.cwd, args.agent, agent_args,
-                          notify=not args.no_notify)
+                          notify=not args.no_notify, auto_name=auto_name)
         if args.detach:
             print(f"Created {args.name}. Attach with: {APP} attach {shlex.quote(args.name)}")
         else:
@@ -3807,7 +4315,7 @@ def main(argv=None):
             print(line)
     elif args.command == "watch":
         return watch_command(tmux, args.interval, once=args.once,
-                             notify_enabled=not args.no_notify)
+                             notify_enabled=not args.no_notify, existing=args.existing)
     elif args.command == "peek":
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             raise Error(f"The viewer requires a terminal. Use {APP} preview for text output.")

@@ -4,6 +4,24 @@ All notable changes to agmux are documented here. The format is loosely based
 on [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [semantic versioning](https://semver.org/).
 
+## [0.9.1]
+
+- Added opt-in Discord alerts with private webhook setup and a delivery test.
+  Questions and failures use the channel's notification settings. Successful
+  completions are silent.
+- Added `watch --existing` for agents open before enabling a notifier.
+- GitHub releases now include an installer archive and its SHA-256 checksum.
+
+## [0.9.0]
+
+- The project picker lists frequently launched directories first and uses the
+  most recent choice to break ties. Existing saved workspaces and recent choices
+  supply the initial ranking.
+- History can reopen the original conversation for supported harnesses. Blank
+  session names take their title from the first submitted message.
+- Codex question and completion badges use live pane activity and local turn
+  records. Exiting Codex has a separate notification.
+
 ## [0.8.1]
 
 ### Fixed

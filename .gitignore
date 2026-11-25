@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+/dist/
+discord-webhook
+.discord-webhook-*

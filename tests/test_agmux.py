@@ -1,4 +1,5 @@
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import io
 import json
@@ -9,7 +10,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 MODULE = Path(__file__).resolve().parents[1] / "agmux.py"
@@ -31,14 +32,19 @@ class TmuxIntegration(unittest.TestCase):
         fake = self.bin / "codex"
         fake.write_text("#!/usr/bin/python3\nimport json, os, sys\n"
                         "from pathlib import Path\n"
-                        "Path(os.environ['AGMUX_TEST_ARGV']).write_text(json.dumps(sys.argv[1:]))\n")
+                        "path = Path(os.environ['AGMUX_TEST_ARGV'])\n"
+                        "temp = path.with_suffix('.' + str(os.getpid()))\n"
+                        "temp.write_text(json.dumps(sys.argv[1:])); temp.replace(path)\n")
         fake.chmod(0o755)
         env = dict(os.environ, AGMUX_TMUX_SOCKET=self.socket, AGMUX_TEST_ARGV=str(self.record),
                    AGMUX_STATE_DIR=str(self.root / "state"), AGMUX_SAVE_INTERVAL="0",
-                   AGMUX_PERSIST="1",
+                   AGMUX_PERSIST="1", AGMUX_WATCH_INTERVAL="1", AGMUX_NOTIFY_CMD="/bin/true",
+                   CODEX_HOME=str(self.root / "codex-home"), CODEX_SQLITE_HOME=str(self.root / "codex-home"),
+                   OPENCODE_DATA_DIR=str(self.root / "opencode"), CLAUDE_CONFIG_DIR=str(self.root / "claude"),
                    PATH=str(self.bin) + os.pathsep + os.environ["PATH"], SHELL="/bin/bash")
         env.pop("TMUX", None)
         env.pop("TMUX_PANE", None)
+        env.pop("AIDER_CHAT_HISTORY_FILE", None)
         self.environment = patch.dict(os.environ, env, clear=True)
         self.environment.start()
         subprocess.run(["tmux", "-S", self.socket, "-f", "/dev/null", "new-session",
@@ -51,6 +57,11 @@ class TmuxIntegration(unittest.TestCase):
         self.environment.stop()
         self.temp.cleanup()
 
+    def codex_args(self):
+        actual = json.loads(self.record.read_text())
+        self.assertEqual(actual[:2], ["-c", agmux._CODEX_TITLE])
+        return actual[2:]
+
     def test_exact_resolution_and_rename(self):
         sid = self.tmux.create("work-long", self.root, agent="shell")
         other = self.tmux.create("work", self.root, agent="shell")
@@ -61,6 +72,34 @@ class TmuxIntegration(unittest.TestCase):
         self.assertEqual(self.tmux.resolve("review with spaces")["id"], sid)
         with self.assertRaises(agmux.Error):
             self.tmux.create("work", self.root, agent="shell")
+
+    def test_wizard_selects_most_used_project_before_more_recent_and_unused(self):
+        hot = self.root / "z-frequent"
+        earlier = self.root / "mid-earlier"
+        later = self.root / "a-later"
+        unused = self.root / "aa-unused"
+        for directory in (hot, earlier, later, unused):
+            directory.mkdir()
+        with patch.dict(os.environ, {"AGMUX_REPOS": str(self.root)}):
+            for i, directory in enumerate((hot, hot, earlier, later)):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    agmux.main(["new", f"test-{i}", "--cwd", str(directory), "--agent", "shell", "--detach"])
+            with self.assertRaises(agmux.Error):
+                self.tmux.create("test-3", later, agent="shell")
+            self.tmux.delete(self.tmux.resolve("test-3")["id"])
+            self.tmux.restore("test-3")
+            with patch.object(agmux, "choose", side_effect=["shell", str(hot)]) as choose, \
+                    patch.object(agmux, "prompt", return_value="from-wizard"):
+                agmux.new_session_flow(None, self.tmux, None)
+        choices = choose.call_args_list[1].args[2]
+        paths = [row["value"] for row in choices]
+        self.assertEqual(paths[:3], list(map(str, (hot, later, earlier))))
+        self.assertIn("2 sessions", choices[0]["note"])
+        self.assertIn(str(unused), paths)
+        agent, uses = agmux.project_history(self.tmux)
+        self.assertEqual(agent, "shell")
+        self.assertEqual(uses[str(hot)], 3)
+        self.assertEqual(uses[str(later)], 1)
 
     def test_names_are_data_and_cwd_is_preserved(self):
         directory = self.root / "project with spaces"
@@ -81,7 +120,7 @@ class TmuxIntegration(unittest.TestCase):
                 break
             time.sleep(0.02)
         self.assertTrue(self.record.exists(), "fake agent did not launch")
-        self.assertEqual(json.loads(self.record.read_text()), arguments)
+        self.assertEqual(self.codex_args(), arguments)
         self.assertFalse((self.root / "PWNED").exists())
         self.assertEqual(self.tmux.resolve(sid)["name"], "codex-argv")
         # The pane must survive the short-lived agent command.
@@ -266,7 +305,7 @@ class TmuxIntegration(unittest.TestCase):
                 break
             time.sleep(0.02)
         self.assertTrue(self.record.exists())
-        self.assertEqual(json.loads(self.record.read_text()),
+        self.assertEqual(self.codex_args(),
                          ["--model", "x y", "$(touch PWNED)", ";"])
         self.assertFalse((self.root / "PWNED").exists())
 
@@ -677,7 +716,7 @@ class TmuxIntegration(unittest.TestCase):
             if self.record.exists():
                 break
             time.sleep(0.02)
-        self.assertEqual(json.loads(self.record.read_text()), ["resume"])
+        self.assertEqual(self.codex_args(), ["resume"])
         self.assertFalse((self.root / "PWNED").exists())
         self.tmux.delete(self.tmux.resolve("agent")["id"])
         self.record.unlink()
@@ -686,18 +725,126 @@ class TmuxIntegration(unittest.TestCase):
             if self.record.exists():
                 break
             time.sleep(0.02)
-        self.assertEqual(json.loads(self.record.read_text()), ["do a task", "$(touch PWNED)", ";"])
+        self.assertEqual(self.codex_args(), ["do a task", "$(touch PWNED)", ";"])
 
     def test_recovery_uses_exact_explicit_codex_id(self):
         sid = self.tmux.create("exact", self.root, agent="codex", agent_args=["resume", "abc-123"])
         self.tmux.delete(sid)
         self.tmux.restore("exact")
         for _ in range(100):
-            if self.record.exists() and json.loads(self.record.read_text()) == ["resume", "abc-123"]:
+            if self.record.exists() and self.codex_args() == ["resume", "abc-123"]:
                 break
             time.sleep(0.02)
-        self.assertEqual(json.loads(self.record.read_text()), ["resume", "abc-123"])
+        self.assertEqual(self.codex_args(), ["resume", "abc-123"])
         self.assertEqual(self.tmux.workspace_store().read()["exact"]["resume_id"], "abc-123")
+
+    def test_live_codex_identity_and_first_message_survive_abrupt_close(self):
+        identity = "00000001-2222-3333-4444-555555555555"
+        db_dir = Path(os.environ["CODEX_SQLITE_HOME"])
+        db_dir.mkdir()
+        db = db_dir / "state_5.sqlite"
+        with sqlite3.connect(db) as con:
+            con.execute("CREATE TABLE threads(id TEXT,first_user_message TEXT)")
+            con.execute("INSERT INTO threads VALUES(?, '')", (identity,))
+            con.execute("INSERT INTO threads VALUES(?, 'Another chat here')",
+                        ("00000002-2222-3333-4444-555555555555",))
+        self.tmux.create("Fix old bug", self.root, agent="shell")
+        self.tmux.delete(self.tmux.resolve("Fix old bug")["id"])
+        binary = self.bin / "codex"
+        binary.write_text("#!/usr/bin/python3\nimport time\n"
+                          f"print('\\033]2;Ready | fixture | {identity[:29]}...\\007', flush=True)\n"
+                          "print('› Draft only',flush=True)\ntime.sleep(60)\n")
+        sid = self.tmux.create("placeholder", self.root, "codex", notify=False, auto_name=True)
+        for _ in range(150):
+            if self.tmux.workspace_store().read()["placeholder"]["resume_id"] == identity:
+                break
+            time.sleep(.02)
+        self.assertEqual(self.tmux.workspace_store().read()["placeholder"]["resume_id"], identity)
+        self.assertEqual(self.tmux.resolve(sid)["name"], "placeholder")
+        with sqlite3.connect(db) as con:
+            con.execute("UPDATE threads SET first_user_message=? WHERE id=?",
+                        ("Fix: old.\nbug", identity))
+        for _ in range(150):
+            if "Fix old bug 2" in self.tmux.workspace_store().read():
+                break
+            time.sleep(.02)
+        self.assertEqual(self.tmux.resolve(sid)["name"], "Fix old bug 2")
+        # Alt-x talks directly to tmux, bypassing the agmux delete checkpoint.
+        self.tmux.run("kill-session", "-t", sid)
+        saved = self.tmux.workspace_store().read()
+        self.assertNotIn("placeholder", saved)
+        self.assertEqual(saved["Fix old bug 2"]["resume_id"], identity)
+        self.assertFalse(saved["Fix old bug 2"]["auto_name"])
+        self.assertIn("Fix old bug", saved)
+        binary.write_text("#!/usr/bin/python3\nimport json,sys\nfrom pathlib import Path\n"
+                          f"Path({str(self.record)!r}).write_text(json.dumps(sys.argv[1:]))\n")
+        self.tmux.restore("Fix old bug 2", notify=False)
+        for _ in range(100):
+            if self.record.exists() and self.record.stat().st_size:
+                break
+            time.sleep(.02)
+        self.assertEqual(self.codex_args(), ["resume", identity])
+
+    def test_new_and_restored_harnesses_receive_the_same_id(self):
+        for agent, flag in (("opencode", "--session"), ("claude", "--resume"),
+                            ("gemini", "--resume")):
+            with self.subTest(agent=agent):
+                binary = self.bin / agent
+                output = self.root / agent
+                binary.write_text("#!/usr/bin/python3\nimport sys,json,time\nfrom pathlib import Path\n"
+                                  "if '--help' in sys.argv:\n"
+                                  " print('--session ID to continue, or to create if it does not exist; --session-id'); exit()\n"
+                                  f"Path({str(output)!r}).write_text(json.dumps(sys.argv[1:]))\ntime.sleep(30)\n")
+                binary.chmod(0o755)
+                sid = self.tmux.create(agent, self.root, agent, notify=False)
+                identity = self.tmux.workspace_store().read()[agent]["resume_id"]
+                self.assertTrue(identity)
+                for _ in range(100):
+                    if output.exists() and output.stat().st_size:
+                        break
+                    time.sleep(.02)
+                self.assertEqual(json.loads(output.read_text())[-1], identity)
+                self.tmux.run("kill-session", "-t", sid)
+                output.unlink()
+                self.tmux.restore(agent, notify=False)
+                for _ in range(100):
+                    if output.exists() and output.stat().st_size:
+                        break
+                    time.sleep(.02)
+                self.assertEqual(json.loads(output.read_text()), [flag, identity])
+
+    def test_aider_sessions_in_one_directory_keep_separate_native_histories(self):
+        binary = self.bin / "aider"
+        binary.write_text("#!/usr/bin/python3\nimport sys,time\nfrom pathlib import Path\n"
+                          "path = Path(sys.argv[sys.argv.index('--chat-history-file')+1])\n"
+                          "if '--restore-chat-history' in sys.argv: print(path.read_text(),flush=True)\n"
+                          "else: path.write_text('fixture ' + path.stem)\ntime.sleep(30)\n")
+        binary.chmod(0o755)
+        first = self.tmux.create("aider-one", self.root, "aider", notify=False)
+        self.tmux.create("aider-two", self.root, "aider", notify=False)
+        records = self.tmux.workspace_store().read()
+        history = Path(records["aider-one"]["history_file"])
+        self.assertNotEqual(str(history), records["aider-two"]["history_file"])
+        for _ in range(100):
+            if history.exists():
+                break
+            time.sleep(.02)
+        self.tmux.delete(first)
+        restored = self.tmux.restore("aider-one", notify=False)
+        for _ in range(100):
+            output = self.tmux.visible_lines(restored)
+            if "fixture " + history.stem in output:
+                break
+            time.sleep(.02)
+        self.assertIn("fixture " + history.stem, output)
+
+    def test_manual_rename_cancels_pending_prompt_name(self):
+        sid = self.tmux.create("default-name", self.root, "shell")
+        self.tmux.session_option(sid, "agmux_auto_name", "default-name")
+        self.tmux.rename(sid, "my name")
+        self.assertFalse(self.tmux.name_from_message(sid, "default-name", "Late first message"))
+        self.assertEqual(self.tmux.resolve(sid)["name"], "my name")
+        self.assertFalse(self.tmux.workspace_store().read()["my name"]["auto_name"])
 
     def test_recovery_captures_complete_codex_exit_id_but_not_wrapped_prefix(self):
         identity = "11111111-2222-3333-4444-555555555555"
@@ -808,6 +955,15 @@ class TmuxIntegration(unittest.TestCase):
 
 
 class PromptHelpers(unittest.TestCase):
+    def test_project_name_match_precedes_fuzzy_path_match(self):
+        screen = Mock()
+        screen.getmaxyx.return_value = (24, 80)
+        screen.get_wch.side_effect = list("demo\r")
+        options = [dict(label="daily", note="12 sessions /home/repos"),
+                   dict(label="demo-project", note="/repos/demo-project")]
+        with patch.object(agmux, "put"):
+            self.assertEqual(agmux.choose(screen, "Project", options, Mock(), paths=True), "demo-project")
+
     def test_complete_path_extends_to_unique_directory(self):
         with tempfile.TemporaryDirectory() as raw:
             (Path(raw) / "alpha-one").mkdir()
@@ -817,14 +973,37 @@ class PromptHelpers(unittest.TestCase):
             self.assertEqual(agmux.complete_path(raw + "/be"), raw + "/beta/")
             self.assertEqual(agmux.complete_path(raw + "/zz"), raw + "/zz")
 
-    def test_recent_choices_round_trip(self):
+    def test_project_history_seeds_saved_workspaces_and_legacy_recents_once(self):
         with tempfile.TemporaryDirectory() as raw, \
-                patch.dict(os.environ, {"AGMUX_STATE_DIR": raw}):
-            self.assertEqual(agmux.load_recent(), ("", []))
-            agmux.remember_recent("opencode", "/a")
-            agmux.remember_recent("codex", "/b")
-            agmux.remember_recent("codex", "/a")
-            self.assertEqual(agmux.load_recent(), ("codex", ["/a", "/b"]))
+                patch.dict(os.environ, {"AGMUX_STATE_DIR": raw, "AGMUX_PERSIST": "1"}), \
+                patch.object(agmux.Tmux, "workspace_store") as store:
+            workspace = agmux.Tmux()
+            hot = Path(raw) / "popular"
+            hot.mkdir()
+            alias = Path(raw) / "alias"
+            alias.symlink_to(hot)
+            path = Path(raw) / "recent.json"
+            recent = ["/recent", str(alias), "/recent"]
+            path.write_text(json.dumps({"agent": "codex", "dirs": recent}))
+            store.return_value.read.return_value = {"one": {"cwd": str(hot)}, "two": {"cwd": str(alias)}}
+            agent, uses = agmux.project_history(workspace)
+            self.assertEqual(agent, "codex")
+            self.assertEqual(list(uses.items()), [("/recent", 1), (str(hot), 2)])
+            store.return_value.read.side_effect = AssertionError("must only import old counts once")
+            for i in range(10):
+                agmux.project_history(workspace, cwd=f"/new-{i}")
+            agent, uses = agmux.project_history(workspace)
+            self.assertEqual(agent, "codex")
+            self.assertEqual(uses[str(hot)], 2)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_concurrent_project_launches_keep_every_count(self):
+        with tempfile.TemporaryDirectory() as raw, \
+                patch.dict(os.environ, {"AGMUX_STATE_DIR": raw, "AGMUX_PERSIST": "0"}):
+            tmux = agmux.Tmux()
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(lambda _: agmux.project_history(tmux, cwd="/same"), range(24)))
+            self.assertEqual(agmux.project_history(tmux), ("", {"/same": 24}))
 
     def test_fit_pads_and_truncates(self):
         self.assertEqual(agmux.fit("abc", 5), "abc  ")
@@ -832,6 +1011,63 @@ class PromptHelpers(unittest.TestCase):
 
 
 class AgentMetadata(unittest.TestCase):
+    def test_harness_resume_arguments_and_legacy_fallbacks(self):
+        identity = "00000001-2222-3333-4444-555555555555"
+        cases = [
+            ("claude", ["--resume=" + identity, "old prompt"], ["--resume", identity]),
+            ("crush", ["-s", identity], ["--session", identity]),
+            ("goose", ["session", "-r", "--session-id", "20261125_2"],
+             ["session", "--resume", "--session-id", "20261125_2"]),
+            ("gemini", ["-r", identity], ["--resume", identity]),
+            ("opencode", ["--session=ses_123"], ["--session", "ses_123"]),
+            ("opencode", ["--server", "http://localhost:4096", "-s", "ses_123", "--prompt", "old"],
+             ["--session", "ses_123", "--server", "http://localhost:4096"]),
+            ("aider", ["--chat-history-file", "my chat.md", "--message", "old prompt"],
+             ["--chat-history-file", "my chat.md", "--restore-chat-history"]),
+            ("codex", ["resume", "--last"], ["resume"]),
+            ("claude", ["--continue"], ["--resume"]),
+        ]
+        for agent, args, expected in cases:
+            with self.subTest(agent=agent, args=args):
+                record = dict(agent=agent, argv=args, resume_id="")
+                self.assertEqual(agmux.recovery_launch(record), (agent, expected))
+                self.assertEqual(agmux.recovery_launch(record, fresh=True), (agent, args))
+        for agent, args in (("gemini", ["--resume", "1"]), ("gemini", ["-r", "latest"]),
+                            ("opencode", ["--continue"]), ("goose", []), ("aider", []),
+                            ("crush", ["--continue"]), ("shell", [])):
+            self.assertEqual(agmux.recovery_launch(dict(agent=agent, argv=args, resume_id="")),
+                             ("shell", []))
+
+    def test_truncated_codex_id_requires_one_exact_native_match(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"CODEX_SQLITE_HOME": temp}):
+            prefix = "00000001-2222-3333-4444-55555"
+            with sqlite3.connect(Path(temp) / "state_5.sqlite") as db:
+                db.execute("CREATE TABLE threads(id TEXT)")
+                db.executemany("INSERT INTO threads VALUES(?)", [(prefix + "1" * 7,), (prefix + "2" * 7,)])
+            self.assertEqual(agmux.codex_identity("Ready | chat | " + prefix + "..."), "")
+            self.assertEqual(agmux.codex_identity("Ready | " + prefix + "1"*7 + " | " + prefix + "..."),
+                             prefix + "1"*7)
+
+    def test_first_message_uses_user_role_and_exact_harness_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            identity = "00000001-2222-3333-4444-555555555555"
+            projects = Path(temp) / "projects" / "example"
+            projects.mkdir(parents=True)
+            messages = [{"type": "assistant", "message": {"content": "Ignore"}},
+                        {"type": "user", "isMeta": True, "message": {"content": "Metadata"}},
+                        {"type": "user", "message": {"content": [{"type": "text", "text": "First question"}]}},
+                        {"type": "user", "message": {"content": "Second question"}}]
+            (projects / (identity + ".jsonl")).write_text("\n".join(map(json.dumps, messages)))
+            with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": temp}):
+                self.assertEqual(agmux.first_message("claude", identity), "First question")
+            path = Path(temp) / "opencode.db"
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE session_message(session_id TEXT,type TEXT,seq INTEGER,data TEXT)")
+                db.executemany("INSERT INTO session_message VALUES(?,?,?,?)", [
+                    ("ses_other", "user", 0, '{"text":"Other"}'), ("ses_test", "assistant", 0, '{"text":"Reply"}'),
+                    ("ses_test", "user", 2, '{"text":"Second"}'), ("ses_test", "user", 1, '{"text":"First"}')])
+            with patch.object(agmux, "OPENCODE_DB", path):
+                self.assertEqual(agmux.first_message("opencode", "ses_test"), "First")
     def test_paused_chat_control_detection_is_specific(self):
         for line in ("New activity · ↓ Back to bottom · esc", "↓ Bottom", "↓ Back to bottom"):
             self.assertIsNotNone(agmux._CODEX_PAUSED_VIEW.fullmatch(line))
@@ -888,6 +1124,34 @@ class AgentMetadata(unittest.TestCase):
 
 
 class AnsiAndState(unittest.TestCase):
+    def test_codex_live_questions_work_and_terminal_exit(self):
+        title = "⠴ Working | fixture | 00000001-2222-3333-4444-55555..."
+        quiz = ["Question 1/2 (2 unanswered)", "Which format should I use?", "› 1. Plain",
+                "2. JSON", "tab to add notes | enter to submit answer | esc to interrupt"] + [""] * 40
+        self.assertEqual(agmux.agent_state("codex", quiz, title), ("blocked", "Which format should I use?"))
+        self.assertEqual(agmux.agent_state("codex", ["1 question · shift+left to answer"], title)[0], "blocked")
+        for mark in ("!", "."):
+            self.assertEqual(agmux.agent_state("codex", [], f"[ {mark} ] Action Required")[0], "blocked")
+        ready = "Ready | fixture | 00000001-2222-3333-4444-55555..."
+        question = ("id", "completed", 123, "Which format should I use?")
+        self.assertEqual(agmux.agent_state("codex", [], ready, question), ("blocked", question[3]))
+        self.assertEqual(agmux.agent_state("codex", [], title, question)[0], "working")
+        self.assertEqual(agmux.agent_state("codex", [], ready, ("id2", "inProgress", 124, ""))[0], "working")
+        self.assertEqual(agmux.agent_state("codex", [], ready, ("id3", "interrupted", 125, ""))[0], "idle")
+        for state, status in (("blocked", "blocked"), ("working", "running"), ("idle", "exited")):
+            self.assertEqual(agmux.row_status(dict(status="exited", unread=1, state=state)), status)
+
+    def test_active_codex_goal_keeps_a_completed_step_running(self):
+        identity = "00000001-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"CODEX_SQLITE_HOME": temp}):
+            with sqlite3.connect(Path(temp) / "thread_history_1.sqlite") as db:
+                db.execute("CREATE TABLE thread_turns(thread_id,turn_id,status,started_at,final_agent_item_id,rollout_ordinal)")
+                db.execute("CREATE TABLE thread_items(thread_id,turn_id,item_id,item_json)")
+                db.execute("INSERT INTO thread_turns VALUES(?, 'step', 'completed', 123, NULL, 1)", (identity,))
+            with sqlite3.connect(Path(temp) / "goals_1.sqlite") as db:
+                db.execute("CREATE TABLE thread_goals(thread_id,status)")
+                db.execute("INSERT INTO thread_goals VALUES(?, 'active')", (identity,))
+            self.assertEqual(agmux.agent_state("codex", [], "Ready", agmux.codex_turn(identity))[0], "working")
     def test_parse_sgr_extracts_style_runs(self):
         runs = agmux.parse_sgr("\x1b[1;31mred bold\x1b[0m plain")
         self.assertEqual(runs[0][0], "red bold")

@@ -11,7 +11,7 @@ _agmux_complete() {
         )
     elif (( COMP_CWORD == 1 )); then
         while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
-            compgen -W 'pick list ls info attach new rename shell delete kill usage agents preview peek watch last detach doctor names save saved restore forget --no-preview --no-notify --no-resources --version' -- "$current"
+            compgen -W 'pick list ls info attach new rename shell delete kill usage agents preview peek watch discord last detach doctor names save saved restore forget --no-preview --no-notify --no-resources --version' -- "$current"
         )
     elif (( COMP_CWORD == 2 )) && [[ "$command" == @(attach|rename|shell|delete|kill|preview|peek|info) ]]; then
         while IFS= read -r session; do
@@ -49,9 +49,11 @@ _agmux_complete() {
         while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
             compgen -W '--json --no-resources' -- "$current"
         )
+    elif [[ "$command" == discord && "$current" == -* ]]; then
+        while IFS= read -r word; do COMPREPLY+=("$word"); done < <(compgen -W '--setup --test' -- "$current")
     elif [[ "$command" == watch && "$current" == -* ]]; then
         while IFS= read -r word; do COMPREPLY+=("$word"); done < <(
-            compgen -W '--interval --once --no-notify' -- "$current"
+            compgen -W '--interval --once --existing --no-notify' -- "$current"
         )
     fi
 }

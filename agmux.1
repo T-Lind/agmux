@@ -1,4 +1,4 @@
-.TH AGMUX 1 "2026" "agmux 0.8.1" "User Commands"
+.TH AGMUX 1 "2026" "agmux 0.9.1" "User Commands"
 .SH NAME
 agmux \- a terminal control panel for tmux and AI coding agents
 .SH SYNOPSIS
@@ -8,7 +8,7 @@ agmux \- a terminal control panel for tmux and AI coding agents
 .B agmux
 lists and manages tmux sessions that run AI coding agents such as Codex,
 OpenCode, or Claude Code, and plain shells. It is a single, dependency\-free
-Python file that reads local tmux metadata and makes no network requests.
+Python picker that reads local tmux metadata. An optional helper sends Discord notifications.
 .PP
 Each session line shows
 .B cpu X%
@@ -38,8 +38,10 @@ List saved workspaces whose names are not currently live. Supports
 .TP
 .B restore [SESSION | --all]
 Recreate missing saved workspaces, detached. Restore windows, panes, layouts,
-zoom, focus, and directories. Codex opens its history picker or a known explicit
-conversation; other agents restore to shells. With
+zoom, focus, and directories. Codex uses the thread ID captured from its live
+pane. Claude, OpenCode, Gemini, Goose, and Crush resume known native IDs. Aider
+restores its per-session or explicitly supplied chat history file. Without an identifier,
+Codex and Claude offer their own pickers and other agents open a shell. With
 .B --fresh
 explicitly replay the original agent launch arguments, including any task prompt.
 Failures keep saved definitions, and --all continues with other workspaces.
@@ -57,8 +59,9 @@ for machine\-readable output.
 .B attach SESSION
 Attach outside tmux; switch the current client inside tmux.
 .TP
-.B new NAME
-Start an agent or shell in a named session. Options:
+.B new [NAME]
+Start an agent or shell. Omitting NAME allows the first submitted message to
+name the session. A manually supplied name takes precedence. Options:
 .BR --agent ,
 .BR --cwd ,
 .BR --shell ,
@@ -102,7 +105,18 @@ tmux buffers, or OSC 52 in supporting terminals.
 Notify when any agent starts waiting for input. Options:
 .BR --interval ,
 .BR --once ,
+.BR --existing ,
 .BR --no-notify .
+.B --existing
+watches the agents open at startup for questions and newly recorded completions.
+.TP
+.B discord --setup | --test
+Save an incoming Discord webhook at a hidden prompt or send a test message.
+Set the following in the agmux config file to enable alerts for new launches:
+.PP
+.nf
+notify_cmd = agmux discord -- "{title}" "{session}" "{exit_code}"
+.fi
 .TP
 .B last
 Switch back to the previous session (inside tmux).
@@ -135,7 +149,8 @@ Refresh sessions and preview now.
 Attach, or switch this terminal to the selected session.
 .TP
 .B Ctrl\-N
-Start an agent or shell session (short wizard).
+Start an agent or shell session. The directory chooser ranks projects by the
+number of successful new sessions and breaks ties by most recent use.
 .TP
 .B Ctrl\-R
 Rename the selected session.
@@ -186,6 +201,11 @@ skips sessions viewed by another terminal. Popup navigation may follow its own
 originating client's session. Set AGMUX_FOLLOW_PREVIEW=0 or follow_preview=0
 to disable this. Other agents' navigation keys are not guessed.
 CLI preview, peek, state checks, and the Ctrl-O viewer remain read-only.
+.PP
+Agmux requests activity and thread identity in the managed Codex pane title.
+A live question or approval takes priority over a completion badge. Codex turn
+completion requires a completed local turn and a stable ready screen. Process
+exit is reported separately.
 .SH RECOVERY
 Recovery is on by default. A local helper saves workspaces every 15 seconds while
 its tmux server lives. Agmux changes also trigger snapshots. After reboot, saved

@@ -1,10 +1,10 @@
 # Security and scope
 
-Scope: `agmux.py`, `install.sh`, `completion.bash`, `tmux.conf`, `agmux.1`,
+Scope: `agmux.py`, `agmux_discord.py`, `install.sh`, `completion.bash`, `tmux.conf`, `agmux.1`,
 `Makefile`, and their installed source lines in `~/.bashrc` and `~/.tmux.conf`.
 agmux is one standard-library Python file plus the `tmux` and agent binaries
-already on the machine. There is no vendor, updater, installed background service, or
-network client. Recovery uses a local helper that exits when its tmux server stops.
+already on the machine, with a separate optional Discord notifier. Recovery
+uses a local helper that exits when its tmux server stops.
 
 ## What agmux accesses
 
@@ -16,11 +16,12 @@ network client. Recovery uses a local helper that exits when its tmux server sto
   `~/.codex/sessions`), and only their trailing bytes, to read the most recent
   `rate_limits` record for the usage panel. No other part of the log is
   displayed or stored.
-- OpenCode's SQLite database under `$OPENCODE_DATA_DIR` (default
-  `~/.local/share/opencode`), opened read-only, and only the session title,
-  cost, token counts (including reasoning/cache when present), model, and update
-  time of the most recent sessions. No credential, message, or account tables
-  are read.
+- Codex's local thread, turn, and goal indexes, opened read-only. Agmux
+  resolves the thread ID shown in the pane title, checks the latest turn
+  and active goal, and reads the final reply's ending to identify a question.
+- OpenCode's read-only SQLite database supplies usage totals and, for automatic
+  naming, the first user message for the exact session ID. Claude automatic
+  naming reads user messages from that session's local project transcript.
 - The visible text of a session's pane, read with `capture-pane`, to label the
   agent and to classify whether it is working, idle, or waiting on the user, and
   to trim the agent's input/status chrome from previews. For agents agmux
@@ -35,8 +36,12 @@ network client. Recovery uses a local helper that exits when its tmux server sto
 - Private recovery JSON files under `$AGMUX_STATE_DIR` or
   `${XDG_STATE_HOME:-~/.local/state}/agmux`, containing tmux topology, directories,
   agent launch arguments (which may include user prompts), and known conversation
-  IDs. Snapshot output never includes pane text or transcripts. Writers lock,
+  IDs. An automatic session name contains the beginning of the first message. Writers lock,
   fsync, and atomically replace mode-0600 files; new storage directories use 0700.
+- Aider writes its native Markdown transcript in a dedicated mode-0700
+  `aider-history` directory under the state directory for ordinary new launches
+  with recovery enabled. The snapshot stores its path. An explicitly configured
+  chat history file takes precedence.
 - Clipboard tools (`wl-copy`, `xclip`, `xsel`, or `pbcopy`), tmux's paste buffer,
   or a base64-encoded OSC 52 terminal request, only when the user explicitly
   copies selected viewer text. No clipboard read or automatic copying occurs.
@@ -44,8 +49,7 @@ network client. Recovery uses a local helper that exits when its tmux server sto
   normal shell path.
 - Settings such as `TMUX`, `TMUX_PANE`, `AGMUX_*`, `CX_*`, and `SHELL`.
 
-agmux contains no HTTP client, socket client, telemetry, updater, credential
-reader, repository-content scanner, or transcript writer. Previews, the viewer,
+The picker, recovery, and usage commands operate locally. Previews, the viewer,
 and the usage panel display data locally without saving it. Pane output may
 contain anything already printed by the program in that pane; use `Ctrl-P` or
 `agmux --no-preview` to hide previews.
@@ -82,7 +86,8 @@ contain anything already printed by the program in that pane; use `Ctrl-P` or
 - Recovery recreates missing workspaces in new sessions and refuses live name
   conflicts. Failure rolls back only the newly created session and preserves
   the saved definition. It does not replay arbitrary pane commands. Codex uses
-  its resume picker or a known explicit ID; other agents restore to shells.
+  its thread ID or its history picker. Other supported harnesses use native
+  resume arguments for a known ID or a saved Aider history file.
   `restore --fresh` explicitly replays saved agent launch arguments.
 - Viewer selection freezes a captured screen; selected text is copied without
   ANSI styling. Clipboard contents are passed via stdin to literal argv commands,
@@ -110,13 +115,21 @@ Completion notifications are best effort and off the critical path. agmux may
 run `notify-send` locally when a session bus is present, or a command you supply
 via `AGMUX_NOTIFY_CMD`. That command is split with shell-like quoting and
 executed directly with `subprocess.Popen` as an argv list — no shell is
-involved — so placeholders are substituted as data. agmux sends no data over the
-network itself.
+involved — so placeholders are substituted as data.
+
+The optional `agmux discord` command is the HTTP client. Setup takes a hidden
+prompt and atomically saves the URL in a mode-0600 file outside the checkout
+by default. Delivery requires a private regular file owned by the current user.
+The helper sends an HTTPS POST to discord.com and ignores redirects. The packaged
+configuration shares the event and session name, which can include the start
+of the first message. The payload disables mentions and link previews. Delivery
+errors omit the URL and response body.
 
 While an agent started by agmux runs, a small daemon thread polls its pane and
 raises the same notification if it looks blocked on a prompt; `agmux watch` does
-the same for all sessions from the command line. These checks only read the
-visible screen (via `capture-pane`) and never send input to a pane.
+the same for all sessions from the command line. The watcher reads the
+visible screen, pane title, and applicable local session records. It can rename
+placeholder sessions and checkpoint their IDs without sending input to a pane.
 
 ## Color
 
@@ -129,7 +142,7 @@ terminal defaults and is never passed through raw escape sequences.
 ## Verification
 
 - Source review: only standard-library imports; no `shell=True`, no shell
-  command launcher, no HTTP or socket client, production file writes limited to private recovery snapshots and locks.
+  command launcher. Outgoing HTTP is isolated in the optional Discord helper.
 - Isolated tmux integration tests (`python3 -m unittest discover -s tests`)
   cover literal argument forwarding including `$()`, backticks, quotes,
   newlines, a standalone `;`, and a tmux format string; exact-name selection;

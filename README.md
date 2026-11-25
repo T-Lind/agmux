@@ -9,7 +9,7 @@ terminal.
 ![The agmux picker: sessions with agent state, a live preview, and per-session CPU and memory](docs/screenshot.svg)
 
 ```
-agmux 0.8.1                     5 sessions · 2 running · 1 need input · 1 done
+agmux 0.9.1                     5 sessions · 2 running · 1 need input · 1 done
 Codex · 5h 12% · 7d 34%       OpenCode 392K tok · $0.27        Ctrl-G details
 Search:
 ! ty-review    Codex    2w  needs input  cpu 12% · mem 486M  codex  ~/source/repos/ty     2m
@@ -36,7 +36,8 @@ through your rate limit. `agmux` is a small, auditable layer that answers those
 questions and stays out of the way.
 
 - **One file, no packages.** Standard library only, plus the `tmux` and agent
-  binaries you already have. No pip, no plugins, no installed service, no network.
+  binaries you already have. The picker runs offline. An optional bundled
+  helper delivers Discord alerts.
 - **Agent-aware.** Knows Codex, OpenCode, Claude Code, Gemini, Aider, Crush, and
   Goose, and can launch any of them — or a plain shell — in a tmux session.
 - **Resource use per session.** A labelled `cpu X% · mem Y` figure next to each
@@ -81,6 +82,12 @@ cd agmux
 ./install.sh
 ```
 
+You can also download the installer archive and its SHA-256 file from the
+[latest release](https://github.com/T-Lind/agmux/releases/latest). In the download
+directory, run `sha256sum -c agmux-0.9.1.tar.gz.sha256`, extract the archive,
+and run `./install.sh` inside the extracted directory. Keep that directory in
+place because the installer links the command to it.
+
 `install.sh` is one command that:
 
 1. links `agmux` (and the historical `cx`) into `~/.local/bin`,
@@ -109,6 +116,12 @@ closed and post-reboot sessions are in the **History** tab (press Right). Type t
 directory, or state; select with Up/Down or Tab/Shift-Tab; press Enter to attach
 (or switch your current client when already inside tmux). Esc cancels. A preview
 shows the selected session's active pane.
+
+Leave the name blank in the new-session wizard, or run `agmux new`, to use
+the first submitted message as the tmux session name. The name uses up to
+48 characters. Duplicate titles get a numeric suffix. Typing a name in the
+wizard, supplying one on the command line, or renaming the session yourself
+takes precedence.
 
 | Key | Action |
 | --- | --- |
@@ -159,6 +172,7 @@ agmux list --no-resources               # skip the CPU/memory sample
 agmux info ty-review                    # detailed view of one session
 agmux info ty-review --json             # the same details as JSON
 agmux attach upgrades-4                 # switch/attach to a session
+agmux new --cwd ~/source/repos/ty        # name from the first message
 agmux new ty-fix --cwd ~/source/repos/ty
 agmux new review --agent opencode --cwd ~/source/repos/ty --detach
 agmux new notes --agent shell           # a plain shell session
@@ -201,13 +215,24 @@ pane's directory. It skips live names instead of replacing them when restoring
 all. A missing directory or failed restore keeps the saved definition for retry,
 and restoring all continues with the other sessions.
 
-Running processes and terminal scrollback are not checkpointed. For Codex,
-restoring opens `codex resume` so you can choose the saved conversation. When
-agmux knows an explicit conversation ID from `new ... -- resume ID`, or captures
-Codex's resume instruction at normal exit, it resumes that ID directly. It never
-uses `--last` to guess between conversations. Other agents restore to shell
-panes; start the agent's own resume flow there. `--fresh` explicitly starts the
-saved agent with its original arguments, including any original task prompt.
+History restores the workspace and opens the conversation using its native
+identifier when available. Running processes and scrollback are outside the
+snapshot.
+
+| Harness | How History finds the conversation |
+| --- | --- |
+| Codex | Reads the active thread ID from its tmux pane title while the chat runs, including after switching threads. An abbreviated ID must resolve uniquely in Codex's local index. A full exit hint also works. |
+| Claude Code | Supplies a session UUID for a new interactive chat and uses `--resume ID` to reopen it. |
+| OpenCode | Supplies an ID on versions whose CLI can create sessions by ID. Also recognizes explicit IDs and the native exit hint. |
+| Gemini | Supplies a UUID on versions supporting `--session-id`, or records an explicit resume UUID. |
+| Goose and Crush | Uses an explicit session ID, Goose's numeric session banner, or a full UUID in Crush's exit hint. |
+| Aider | For a plain launch with recovery enabled, gives Aider a separate native chat history file under `$AGMUX_STATE_DIR/aider-history/`. Also honors `AIDER_CHAT_HISTORY_FILE` on a plain launch and an explicit `--chat-history-file`. |
+
+For a saved workspace without an ID, Codex and Claude open their own history
+pickers. Selecting the old Codex chat lets agmux save the association. Other
+harnesses fall back to shell panes when they lack a known conversation or
+history file. The History preview tells you what Enter will do.
+`--fresh` explicitly replays the original arguments, including any task prompt.
 
 Closed sessions remain recoverable. `Ctrl-D` on a saved row, or
 `agmux forget NAME`, removes its definition after typed confirmation (`--yes`
@@ -217,8 +242,8 @@ saved again on the next checkpoint. Renaming moves the saved definition.
 Snapshots are stored separately per tmux socket under
 `${XDG_STATE_HOME:-~/.local/state}/agmux`. They use private files (mode `0600`)
 and atomic replacement with a writer lock. They contain workspace paths, agent
-launch arguments, and known resume IDs, not pane output or transcripts. If launch
-arguments contain sensitive text, that text is included in this private file.
+launch arguments, known resume IDs, and session names. Names generated from a
+first message and prompts supplied as launch arguments appear in the snapshot.
 `agmux doctor` reports its path and recovery status. Invalid snapshots are
 reported and preserved instead of silently overwritten.
 
@@ -316,13 +341,11 @@ footers; set `AGMUX_TRIM_CHROME=0` to keep the agent chrome.
 
 ### Completion notifications
 
-When agmux starts an agent, it wraps the process just enough to notice exit. The
-session is marked running, then finished on exit, and agmux:
-
-1. flags the session with `✓` in the picker (cleared when you attach),
-2. prints a tmux status message to attached clients, and
-3. fires a desktop notification via `notify-send` when a session bus is
-   available.
+For Codex, a turn earns a completion badge when the local turn index records
+completion and the TUI stays ready for two checks. An active goal between steps
+still counts as working. A pending question takes priority. Closing Codex
+produces a separate exit notice. Other managed harnesses report process exit.
+Attaching clears the unread badge.
 
 Notifications are on by default. Disable per-session with `--no-notify`, or
 globally with `AGMUX_NOTIFY=0`. To route notifications anywhere else, set
@@ -335,6 +358,35 @@ export AGMUX_NOTIFY_CMD='ntfy publish mytopic "{body}"'
 
 The command is split with shell-like quoting and executed directly; no shell is
 involved.
+
+#### Discord alerts
+
+Create an incoming webhook for the Discord channel that should receive alerts.
+On the machine that runs agmux, paste its URL at the hidden setup prompt.
+
+```bash
+agmux discord --setup
+agmux discord --test
+```
+
+Put this line in `~/.config/agmux/config` to route agent notifications to
+Discord. Each installation uses its own webhook, stored in an owner-only file
+at `$XDG_CONFIG_HOME/agmux/discord-webhook` (default `~/.config/agmux/discord-webhook`).
+
+```ini
+notify_cmd = agmux discord -- "{title}" "{session}" "{exit_code}"
+```
+
+Questions and nonzero exits use the channel's normal notification settings.
+Choose **All Messages** in Discord for phone alerts. Successful completions and
+clean exits arrive silently. Discord receives the event and session name.
+Automatic names include the start of your first message. Use an explicit name
+for sensitive work. Incoming webhooks provide one-way delivery.
+
+New and restored sessions pick up this setting at launch. To cover agents
+already open when you enabled Discord, run `agmux watch --existing` once in a
+separate terminal. It watches that group for questions, newly recorded turn
+completions and agent exits, then stops when the group closes.
 
 ### When an agent needs you
 
@@ -357,8 +409,11 @@ agmux watch                # poll every few seconds until interrupted
 agmux watch --once         # a single pass (handy in scripts)
 ```
 
-Detection is heuristic — agents draw their prompts differently and change them
-over time. The defaults cover common `[y/N]` / "Allow …" / "Would you like to …"
+For managed Codex sessions, agmux configures a per-launch terminal title with
+activity, status, thread title, and ID. It combines that with the native turn
+record to recognize permission dialogs, question forms, queued question
+shortcuts, and final replies ending in a question. Other harnesses and older
+clients use screen heuristics. The defaults cover common `[y/N]` / "Allow …" / "Would you like to …"
 / numbered-approval forms. Extend them with `AGMUX_BLOCKED_PATTERNS` and
 `AGMUX_WORKING_PATTERNS`: `'|'`-joined regular expressions appended to the
 built-ins, matched case-insensitively against the last screen lines.
@@ -381,13 +436,17 @@ Codex windows. It understands both the older `session` table and the newer
 timestamps stored in seconds or milliseconds. Set `OPENCODE_DATA_DIR` if your
 database lives elsewhere.
 
-Both are local file reads; agmux makes **no network requests** and reads no
-credentials. Other agents do not expose comparable local data, so the panel
+Both usage sources are local file reads. Other agents do not expose comparable local data, so the panel
 says so rather than guessing.
 
 ## Projects and configuration
 
-The new-session wizard lists the immediate subdirectories of your **project
+The new-session wizard puts your most-used project first, ready to select with
+Enter. Each successful launch from the wizard or `agmux new` counts once. Ties
+favor the most recently selected directory. On upgrade, your saved workspaces
+and recent choices supply the initial counts.
+
+The wizard also lists the immediate subdirectories of your **project
 roots** as candidate working directories. By default that is `~/source/repos`;
 set `AGMUX_REPOS` to change it. It accepts several roots separated by `:`, and
 `~` is expanded. The wizard also offers the current directory, your home
@@ -428,9 +487,8 @@ usual setup is to install it on each machine (`git clone && ./install.sh`) and
 keep `~/.config/agmux/config` in your dotfiles. Sessions do **not** federate
 across machines — a session lives on the tmux server where it was created.
 To work with a remote machine, run agmux there (for example over SSH, or via
-`tmux -L`/`AGMUX_TMUX_SOCKET` against a remote socket). agmux itself still makes
-no network connections; it only ever reads the local tmux server and local
-files.
+`tmux -L`/`AGMUX_TMUX_SOCKET` against a remote socket). Configure Discord
+separately on each machine where you want remote alerts.
 
 ### Plain shells
 
@@ -471,8 +529,8 @@ Every setting has an environment variable; all are optional.
 agmux is deliberately small so you can read all of it. It uses only the Python
 standard library and local `tmux`/agent binaries; it reads local tmux metadata,
 directory names, private recovery snapshots, one `ps` process listing (pid, parent, CPU%, RSS), the optional
-config file, and Codex/OpenCode usage logs; it makes no network requests and
-reads no credential files. Session names and pane output are filtered for
+config file, and Codex/OpenCode usage logs. The optional Discord helper reads
+its private webhook file and posts alerts to Discord. Session names and pane output are filtered for
 control characters before display. Agent arguments are passed as literal argv
 (never a shell string). Deletion targets exactly one resolved session and
 re-validates it immediately before killing. See [SECURITY.md](SECURITY.md) for
